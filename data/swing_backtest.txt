@@ -1,0 +1,56 @@
+==============================================================================
+  59-DAY SWING BACKTEST — multi-day holds, gap-aware exits
+==============================================================================
+  Window          2026-06-17 → 2026-09-10  (59 sessions)
+  Universe        29 symbols
+  Entry           oversold
+  Stop            2.5% fixed
+  Target          2.5R
+  Hold            until stop or target — NO end-of-day flatten
+  Max concurrent  4
+
+  --------------------------------------------------------------------------
+  METRIC                                      VALUE   NOTE                
+  --------------------------------------------------------------------------
+  Closed trades                                  67
+  Win rate                                    52.2%   95% CI 40–64%
+  Net P&L ($)                                -10.69
+  Net P&L (%)                                -0.11%   on starting capital
+  Max drawdown ($)                           527.93   marked to market
+  Max drawdown (%)                            5.26%
+  Sharpe ratio                                0.100   annualised, daily
+  Sortino ratio                               0.179
+  Profit factor                               0.995
+  Avg hold (days)                               4.2
+  --------------------------------------------------------------------------
+  Expectancy per trade (R)                    0.003   P&L / risk taken
+  Partial scales taken                           36   54% of closed trades
+  Blocked — earnings                             54   entries skipped
+  --------------------------------------------------------------------------
+  Unresolved at end                               4   MTM +20.59, excluded
+  Exits filled via gap                            9   13% of closed trades
+  --------------------------------------------------------------------------
+  SPY buy & hold                              2.28%   same window
+  QQQ buy & hold                             -1.92%   same window
+  --------------------------------------------------------------------------
+
+  FUNNEL
+    signals fired          1750
+    skipped — book full    1263
+    skipped — earnings     54
+    skipped — sizing/cash  362
+    trades taken           71
+    reconciles
+
+  EXITS
+    STOP           28 (  42%)  net  -1,748.28
+    BE_STOP        17 (  25%)  net    +511.06
+    TARGET         11 (  16%)  net  +1,160.02
+    GAP_BE_STOP     5 (   7%)  net     +13.77
+    GAP_STOP        2 (   3%)  net    -203.27
+    PRE_EARNINGS    2 (   3%)  net      +4.21
+    GAP_TARGET      2 (   3%)  net    +251.81
+
+  GAP RISK — the cost of holding overnight
+    stops gapped through   2
+    average overshoot      1.69% worse than the stop

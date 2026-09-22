@@ -1,0 +1,321 @@
+"""
+Data loading + indicator math for Step 1 of the Fixed ADX Hybrid Strategy —
+built in COMPLETE ISOLATION from the live paper-trading engine. This module
+(and hybrid_engine.py) never imports intraday.py or execution_engine.py, and
+never will.
+
+What this DOES reuse — shared, read-only library code, not the live engine:
+  * backtest.MIXED_UNIVERSE                          — the 30-symbol universe
+  * backtest.{ADX_RANGE_MAX, ADX_TREND_MIN, ADX_PERCENTILE_WINDOW,
+    ADX_PERCENTILE_Q, ATR_PERIOD, VOLUME_MULT, VOLUME_SMA_WINDOW,
+    BREAKOUT_LOOKBACK}                                — the Fixed ADX
+    Hybrid's own constants from backtest.py's Phase 3.1 section, so this
+    stays consistent with the already-validated backtest instead of
+    drifting on a second, hand-typed copy of the same numbers.
+  * strategy.{rsi, bollinger, adx, atr}               — shared Wilder-smoothed
+    indicator primitives (same functions the backtest and the live engine
+    both use).
+  * config.{RSI_PERIOD, BB_PERIOD, BB_K, RSI_OVERSOLD} — the same oversold
+    thresholds Phase 1 validated.
+  * data.daily_bars / data.last_price                 — the existing
+    yfinance data layer (disk-cached under .cache/; that cache is the only
+    thing this module ever writes to disk).
+
+DATA WINDOW — a deliberate deviation from "fetch 50 daily bars"
+    50 raw bars cannot support this module's own math. ADX(14) needs ~14
+    bars of warmup before its first reading exists at all, and the 80th-
+    percentile threshold needs 50 of THOSE readings in a rolling window —
+    50 total bars would yield close to zero valid percentile observations,
+    not a real 50-sample window. This fetches ~6 months (~126 trading days)
+    instead: comfortable warmup for RSI(14)/Bollinger(20)/ATR(14)/ADX(14)
+    plus a properly-populated 50-session ADX percentile. It deliberately
+    still avoids the 200-bar SMA200 trend gate Phase 1's full signal uses —
+    the dip criterion specified here is exactly RSI<35 OR price<=lower BB,
+    no trend filter, so 200 bars of history buys nothing for this build.
+
+SIGNAL TIMING — last COMPLETED daily bar, never today's still-forming one
+    Same non-repainting discipline the live engine's --screen fix uses:
+    yfinance's "today" row updates live during the session, so reading it
+    for indicator values would let this snapshot's classification change
+    mid-day without a bar actually closing. Only the live PRICE column uses
+    a genuinely current quote (data.last_price) — everything else (RSI, ADX,
+    volume ratio, ATR) is read off the last bar that actually closed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
+import data
+import strategy
+from backtest import (
+    MIXED_UNIVERSE,
+    ADX_RANGE_MAX, ADX_TREND_MIN, ADX_PERCENTILE_WINDOW, ADX_PERCENTILE_Q,
+    ATR_PERIOD, VOLUME_MULT, VOLUME_SMA_WINDOW, BREAKOUT_LOOKBACK,
+)
+from calendar_util import now_ny
+from config import RSI_PERIOD, BB_PERIOD, BB_K, RSI_OVERSOLD, STOP_PCT, TARGET_R
+
+DATA_PERIOD = "6mo"                              # see module docstring
+MIN_BARS_REQUIRED = ADX_PERCENTILE_WINDOW + 30   # ADX warmup + real buffer
+
+# ---------------------------------------------------------------- Step 2/3: sizing
+# Asymmetric risk: a DIP is a confirmed mean-reversion setup (oversold, prior
+# edge validated in Phase 1); a BREAKOUT is taken the moment it prints, with
+# no confirmation yet that the move continues, so it gets a much smaller risk
+# budget.
+#
+# Step 3 aligns the stop with backtest.py's validated Fixed Hybrid exactly,
+# correcting Step 2's deliberate simplification (one unified 2.0x ATR stop
+# for both signal types):
+#   DIP      — fixed STOP_PCT (2.5%, config.py — same constant Phase 1's
+#              backtest uses, not a second hand-typed 0.025) off entry.
+#              Also gets a TARGET_R (2.5R, config.py) profit target, since
+#              a fixed-% stop needs a defined R-unit to size a target off —
+#              BREAKOUT has no target, exiting purely via the trailing stop.
+#   BREAKOUT — 2.0x ATR14, unchanged from Step 2.
+RISK_PCT_DIP = 0.00625        # 0.625% of equity per DIP trade
+RISK_PCT_BREAKOUT = 0.0025    # 0.25% of equity per BREAKOUT trade
+STOP_ATR_MULT = 2.0           # BREAKOUT initial stop = Entry - STOP_ATR_MULT x ATR14
+
+
+@dataclass
+class SymbolSnapshot:
+    symbol: str
+    price: float               # live quote
+    rsi: float                 # last completed bar
+    bb_low: float
+    adx: float
+    adx_80th: float
+    volume: float
+    vol_sma20: float
+    vol_ratio: float           # volume / vol_sma20
+    atr: float
+    prior_high: float
+    dip_ok: bool
+    breakout_ok: bool
+    mode: str                  # "DIP" | "BREAKOUT" | "NONE"
+
+
+def load_symbol_frame(symbol: str) -> pd.DataFrame | None:
+    """
+    Daily bars for `symbol` plus every indicator this module needs, or None
+    if there is not enough history yet. Adds: RSI, BB_LOW, ADX, ADX_80TH,
+    ATR14, VOL_SMA20, VOL_RATIO, PRIOR_HIGH, DIP_OK, BREAKOUT_OK.
+    """
+    try:
+        daily = data.daily_bars(symbol, period=DATA_PERIOD)
+    except Exception:
+        return None
+    if daily.empty or len(daily) < MIN_BARS_REQUIRED:
+        return None
+
+    close = daily["Close"].to_numpy(dtype=float)
+    high = daily["High"].to_numpy(dtype=float)
+    low = daily["Low"].to_numpy(dtype=float)
+    volume = daily["Volume"].to_numpy(dtype=float)
+
+    rsi_v = strategy.rsi(close, RSI_PERIOD)
+    _, bb_low, _ = strategy.bollinger(close, BB_PERIOD, BB_K)
+    adx_v = strategy.adx(high, low, close, ATR_PERIOD)
+    atr_v = strategy.atr(high, low, close, ATR_PERIOD)
+
+    # Dynamic momentum threshold: rolling ADX_PERCENTILE_WINDOW-session
+    # ADX_PERCENTILE_Q percentile, shifted one day so it never includes the
+    # value being tested against it, floored at ADX_TREND_MIN so a quiet
+    # stretch can't drop the bar below the original fixed threshold — exactly
+    # backtest.py's daily_hybrid_fixed_frame() logic.
+    adx_80th = (pd.Series(adx_v).shift(1)
+               .rolling(ADX_PERCENTILE_WINDOW).quantile(ADX_PERCENTILE_Q)
+               .clip(lower=ADX_TREND_MIN).to_numpy())
+
+    vol_sma20 = pd.Series(volume).rolling(VOLUME_SMA_WINDOW).mean().to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vol_ratio = np.where(vol_sma20 > 0, volume / vol_sma20, np.nan)
+
+    prior_high = pd.Series(high).shift(1).rolling(BREAKOUT_LOOKBACK).max().to_numpy()
+
+    dip_rsi_ok = np.where(np.isnan(rsi_v), False, rsi_v < RSI_OVERSOLD)
+    dip_bb_ok = np.where(np.isnan(bb_low), False, close <= bb_low)
+    dip_ok = dip_rsi_ok | dip_bb_ok
+
+    vol_ok = np.where(np.isnan(vol_ratio), False, vol_ratio > VOLUME_MULT)
+    breakout_price_ok = np.where(np.isnan(prior_high), False, close > prior_high)
+    breakout_ok = breakout_price_ok & vol_ok
+
+    out = daily.copy()
+    out["RSI"] = rsi_v
+    out["BB_LOW"] = bb_low
+    out["ADX"] = adx_v
+    out["ADX_80TH"] = adx_80th
+    out["ATR14"] = atr_v
+    out["VOL_SMA20"] = vol_sma20
+    out["VOL_RATIO"] = vol_ratio
+    out["PRIOR_HIGH"] = prior_high
+    out["DIP_OK"] = dip_ok
+    out["BREAKOUT_OK"] = breakout_ok
+    return out
+
+
+def classify_mode(adx_v: float, adx_80th: float, dip_ok: bool,
+                  breakout_ok: bool) -> str:
+    """
+    Fixed ADX Hybrid's regime routing, matching
+    backtest.run_adx_hybrid_fixed_backtest() exactly: ranging
+    (ADX < ADX_RANGE_MAX) is DIP-eligible; trending (ADX above this symbol's
+    own dynamic 80th-percentile threshold) is BREAKOUT-eligible; the
+    transition band between routes to neither.
+    """
+    if adx_v != adx_v:                    # NaN — ADX not warmed up
+        return "NONE"
+    if adx_v < ADX_RANGE_MAX and dip_ok:
+        return "DIP"
+    if adx_80th == adx_80th and adx_v > adx_80th and breakout_ok:
+        return "BREAKOUT"
+    return "NONE"
+
+
+def snapshot(symbol: str) -> SymbolSnapshot | None:
+    """Live snapshot for one symbol, using the last COMPLETED daily bar."""
+    frame = load_symbol_frame(symbol)
+    if frame is None:
+        return None
+
+    today = now_ny().date()
+    hist = frame[frame.index.date < today]
+    if hist.empty:
+        return None
+    last = hist.iloc[-1]
+
+    rsi_v = float(last["RSI"])
+    bb_low = float(last["BB_LOW"])
+    adx_v = float(last["ADX"])
+    adx_80th = float(last["ADX_80TH"])
+    vol_ratio = float(last["VOL_RATIO"])
+    atr_v = float(last["ATR14"])
+    prior_high = float(last["PRIOR_HIGH"])
+    dip_ok = bool(last["DIP_OK"])
+    breakout_ok = bool(last["BREAKOUT_OK"])
+
+    price = data.last_price(symbol)
+    if price is None or price <= 0:
+        price = float(last["Close"])       # fall back to last completed close
+
+    mode = classify_mode(adx_v, adx_80th, dip_ok, breakout_ok)
+
+    return SymbolSnapshot(
+        symbol=symbol, price=price, rsi=rsi_v, bb_low=bb_low, adx=adx_v,
+        adx_80th=adx_80th, volume=float(last["Volume"]),
+        vol_sma20=float(last["VOL_SMA20"]), vol_ratio=vol_ratio, atr=atr_v,
+        prior_high=prior_high, dip_ok=dip_ok, breakout_ok=breakout_ok,
+        mode=mode)
+
+
+def snapshot_universe(symbols: list[str] | None = None) -> list[SymbolSnapshot]:
+    """Snapshot every symbol in `symbols` (default MIXED_UNIVERSE), silently
+    skipping any with insufficient data."""
+    symbols = symbols if symbols is not None else MIXED_UNIVERSE
+    out: list[SymbolSnapshot] = []
+    for sym in symbols:
+        snap = snapshot(sym)
+        if snap is not None:
+            out.append(snap)
+    return out
+
+
+@dataclass
+class HybridOrder:
+    symbol: str
+    trade_type: str             # "DIP" | "BREAKOUT"
+    entry_price: float
+    atr14: float | None         # None only if ATR happened to be undefined
+    stop_price: float
+    target_price: float | None  # DIP only; None for BREAKOUT
+    risk_pct: float
+    risk_dollars: float
+    shares: float                # fractional — see size_order()'s docstring
+    notional: float
+
+
+# Fractional-share precision this module sizes to before the broker layer's
+# own (venue-specific) rounding at submission time — see
+# hybrid_engine.execute_signals()/buy_market(). 6dp matches Robinhood's
+# documented fractional-order precision; Alpaca's buy_market() rounds to
+# 4dp internally, so a 6dp value sized here is never LESS precise than
+# either venue actually accepts, just possibly rounded slightly further at
+# submission.
+SHARE_PRECISION = 6
+
+
+def size_order(snap: SymbolSnapshot, equity: float) -> HybridOrder | None:
+    """
+    Step 3 asymmetric sizing: DIP risks RISK_PCT_DIP of equity off a fixed
+    STOP_PCT stop with a TARGET_R profit target; BREAKOUT risks the tighter
+    RISK_PCT_BREAKOUT off a STOP_ATR_MULT x ATR14 stop with no fixed target
+    (it exits via the trailing stop in --manage instead).
+
+    Shares = risk_dollars / (entry - stop), sized to a PRECISE FRACTIONAL
+    quantity (rounded only to SHARE_PRECISION, never floored to a whole
+    share) — entries submit via Broker.buy_market() (see
+    hybrid_engine.execute_signals()), which both Alpaca and Robinhood
+    accept fractional quantities on; buy_limit() (whole-share only on both
+    venues) is no longer used for entries. Returns None if the signal
+    isn't DIP/BREAKOUT, ATR isn't defined (BREAKOUT only — DIP's stop
+    doesn't need it), the stop doesn't land below entry, or the sized
+    quantity rounds to <= 0.
+    """
+    if snap.mode not in ("DIP", "BREAKOUT"):
+        return None
+
+    entry = snap.price
+    target: float | None = None
+
+    if snap.mode == "DIP":
+        risk_pct = RISK_PCT_DIP
+        stop = entry * (1.0 - STOP_PCT)
+        risk_per_share = entry - stop
+        if risk_per_share > 0:
+            target = entry + risk_per_share * TARGET_R
+    else:
+        risk_pct = RISK_PCT_BREAKOUT
+        if snap.atr != snap.atr or snap.atr <= 0:      # NaN/invalid guard
+            return None
+        stop = entry - STOP_ATR_MULT * snap.atr
+        risk_per_share = entry - stop
+
+    if risk_per_share <= 0:
+        return None
+
+    risk_dollars = equity * risk_pct
+    shares = round(risk_dollars / risk_per_share, SHARE_PRECISION)
+    if shares <= 0:
+        return None
+
+    return HybridOrder(
+        symbol=snap.symbol, trade_type=snap.mode, entry_price=round(entry, 4),
+        atr14=round(snap.atr, 4) if snap.atr == snap.atr else None,
+        stop_price=round(stop, 4),
+        target_price=round(target, 4) if target is not None else None,
+        risk_pct=risk_pct, risk_dollars=round(risk_dollars, 2),
+        shares=shares, notional=round(shares * entry, 2))
+
+
+def current_atr(symbol: str) -> float | None:
+    """
+    Today's updated ATR14 for an already-open position, off the last
+    COMPLETED daily bar (same non-repainting discipline as snapshot()) — used
+    by hybrid_engine.py --manage to ratchet a BREAKOUT trailing stop. None if
+    there isn't enough history or ATR isn't defined yet.
+    """
+    frame = load_symbol_frame(symbol)
+    if frame is None:
+        return None
+    today = now_ny().date()
+    hist = frame[frame.index.date < today]
+    if hist.empty:
+        return None
+    atr_v = float(hist.iloc[-1]["ATR14"])
+    return atr_v if atr_v == atr_v else None

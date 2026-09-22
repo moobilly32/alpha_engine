@@ -1,0 +1,6 @@
+# Execution-engine dependencies (broker layer). All already present in this env.
+alpaca-py>=0.33          # AlpacaBroker
+robin-stocks>=3.4        # RobinhoodBroker
+python-dotenv>=1.0       # .env loading
+pyotp>=2.9               # optional: headless Robinhood MFA (RH_MFA_SECRET)
+plotext>=6.1             # project_pnl.py terminal equity-curve chart

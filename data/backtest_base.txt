@@ -1,0 +1,70 @@
+==============================================================================
+  59-DAY INTRADAY BACKTEST — Hybrid Screener + Trend Join Long
+==============================================================================
+  Window          2026-06-15 → 2026-09-08  (59 sessions)
+  Universe        29 symbols
+  Starting cap    $10,000.00
+  Cadence         every 15 min, 10:00–14:00 ET
+  Exits           2.0% stop · 3.0R target · flat 15:55 ET
+  Exec-range gate ON
+
+  --------------------------------------------------------------------------
+  METRIC                                      VALUE   NOTE                
+  --------------------------------------------------------------------------
+  Total trades                                  136                       
+  Win rate                                    42.6%   95% CI 35–51%
+  Winners / losers                          58 / 78                       
+  Net P&L ($)                               -450.76                       
+  Net P&L (%)                                -4.51%   on starting capital
+  Final equity                             9,549.24                       
+  Max drawdown ($)                           537.75                       
+  Max drawdown (%)                            5.40%                       
+  Sharpe ratio                               -2.117   annualised, daily
+  Sortino ratio                              -2.883                       
+  Profit factor                               0.746                       
+  --------------------------------------------------------------------------
+  SPY buy & hold                              1.47%   same window
+  QQQ buy & hold                             -3.45%   same window
+  --------------------------------------------------------------------------
+  Average win                                +22.77
+  Average loss                               -22.71
+  Expectancy / trade                          -3.31
+  Avg bars held (5m)                           57.1
+  --------------------------------------------------------------------------
+
+  FUNNEL
+    signals fired                 206
+    skipped — outside exec range  1
+    skipped — book full           0
+    trades taken                  136
+
+  EXITS
+    EOD_FLAT       123  (  90%)  net    +324.51
+    STOP            13  (  10%)  net    -775.27
+
+  BY SYMBOL (most active first)
+    SYM       N  WINS       NET $
+    AAPL     12     7      +67.82
+    GOOGL    11     6      +25.21
+    KO       11     2     -163.75
+    NVDA     11     5      +88.24
+    MSFT      9     3      -40.83
+    VRTX      9     2      -77.91
+    OKE       8     6      -10.25
+    HON       7     0     -310.92
+    CAT       6     3      -48.32
+    COP       6     1      -90.94
+    LLY       6     1     -103.39
+    PSX       6     4      +22.59
+    SLB       6     3      +49.21
+    XOM       6     3      -29.31
+    AMZN      5     2      -21.64
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  BIAS DISCLOSURE
+  The watchlist was selected using TODAY's fundamentals and then run
+  backwards over this window. yfinance serves no point-in-time balance
+  sheets, so every name is one that survived to today looking healthy.
+  This measures the TECHNICAL layer on a hindsight-chosen universe — it
+  is not evidence that the screener adds value.
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

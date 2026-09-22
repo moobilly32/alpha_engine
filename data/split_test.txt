@@ -1,0 +1,148 @@
+====================================================================================
+  FUNDAMENTAL SCORE SPLIT TEST
+====================================================================================
+  Pool 195 · cleared gate 138 · cohort size 10
+  Financials in score cohorts: NO (score formula undefined for banks)
+
+  TOP          ALB, VLO, MU, NVDA, MPC, EOG, DD, WDAY, AVGO, NXPI
+               score 58.1–71.6 · Technology 5, Energy 3, Basic 2
+  BOTTOM       ECL, CMG, KO, LIN, LOW, WMT, ISRG, HON, HCA, ORLY
+               score 4.0–15.1 · Consumer 3, Basic 2, Consumer 2
+  FAILED_GATE  TSLA, INTC, ORCL, HD, PANW, CRWD, AMGN, QCOM, DE, GILD
+               score 0.0–0.0 · Technology 5, Consumer 2, Healthcare 2
+
+  Note the sector skew: this is why every comparison below is differenced
+  against each cohort's OWN non-signal bars, not against zero.
+
+====================================================================================
+  PER-COHORT EDGE  (signal bars minus that cohort's own other bars)
+====================================================================================
+  COHORT        SIGNALS    HORIZON    SIGNAL  BASELINE      EDGE   vs FRICTION
+  --------------------------------------------------------------------------------
+  TOP                66    +15 min   0.0821%   0.0026%   0.0795%         below
+                           +30 min   0.1009%   0.0076%   0.0933%         below
+                           +60 min   0.0960%   0.0195%   0.0765%         below
+                          to close  -0.0212%  -0.0117%  -0.0095%         below
+  --------------------------------------------------------------------------------
+  BOTTOM             37    +15 min  -0.0654%  -0.0091%  -0.0563%         below
+                           +30 min  -0.1029%  -0.0200%  -0.0829%         below
+                           +60 min  -0.1389%  -0.0413%  -0.0976%         below
+                          to close  -0.3716%  -0.1401%  -0.2315%         below
+  --------------------------------------------------------------------------------
+  FAILED_GATE        55    +15 min  -0.2374%  -0.0018%  -0.2356%         below
+                           +30 min  -0.1948%  -0.0025%  -0.1924%         below
+                           +60 min  -0.2050%  -0.0021%  -0.2029%         below
+                          to close   0.0047%  -0.0190%   0.0238%         below
+  --------------------------------------------------------------------------------
+
+====================================================================================
+  DIFFERENCE-IN-DIFFERENCES
+====================================================================================
+
+  A = top-scoring decile   B = bottom-scoring decile   (tests the SCORE)
+  HORIZON         EDGE(A)    EDGE(B)        DiD                95% CI        p
+  --------------------------------------------------------------------------------
+  +15 min         0.0795%   -0.0563%    0.1358%      [-0.001, +0.276]   0.0524
+  +30 min         0.0933%   -0.0829%    0.1762%      [+0.006, +0.350]   0.0422 *  <-- PRIMARY
+  +60 min         0.0765%   -0.0976%    0.1741%      [-0.066, +0.416]   0.1555
+  to close       -0.0095%   -0.2315%    0.2220%      [-0.252, +0.683]   0.3455
+
+  A = top-scoring decile   B = gate failures        (tests the GATE)
+  HORIZON         EDGE(A)    EDGE(B)        DiD                95% CI        p
+  --------------------------------------------------------------------------------
+  +15 min         0.0795%   -0.2356%    0.3151%      [+0.142, +0.497]   0.0001 *
+  +30 min         0.0933%   -0.1924%    0.2857%      [+0.041, +0.531]   0.0223 *  <-- PRIMARY
+  +60 min         0.0765%   -0.2029%    0.2794%      [+0.002, +0.560]   0.0488 *
+  to close       -0.0095%    0.0238%   -0.0333%      [-0.498, +0.429]   0.9015
+
+====================================================================================
+  VOLATILITY-NORMALISED  —  returns in units of each name's own 5-min sd
+====================================================================================
+  The score correlates ~+0.60 with realized volatility and the top decile
+  is ~1.6x more volatile than the bottom, so percentage returns scale with
+  the score mechanically. If the effect above is real rather than a beta
+  artifact, it must survive here.
+
+  A = top decile   B = bottom decile   (SCORE, vol-normalised)
+  HORIZON         EDGE(A)    EDGE(B)        DiD                95% CI        p
+  --------------------------------------------------------------------------------
+  +15 min         0.3230sd   -0.3437sd    0.6667sd      [+0.137, +1.218]   0.0130 *
+  +30 min         0.3593sd   -0.5004sd    0.8597sd      [+0.172, +1.565]   0.0165 *  <-- PRIMARY
+  +60 min         0.3115sd   -0.5567sd    0.8683sd      [-0.113, +1.884]   0.0854
+  to close        0.3801sd   -1.4693sd    1.8494sd      [-0.011, +3.740]   0.0520
+
+  A = top decile   B = gate failures   (GATE, vol-normalised)
+  HORIZON         EDGE(A)    EDGE(B)        DiD                95% CI        p
+  --------------------------------------------------------------------------------
+  +15 min         0.3230sd   -0.5037sd    0.8266sd      [+0.363, +1.309]   0.0003 *
+  +30 min         0.3593sd   -0.4130sd    0.7723sd      [+0.117, +1.431]   0.0193 *  <-- PRIMARY
+  +60 min         0.3115sd   -0.4564sd    0.7679sd      [-0.048, +1.587]   0.0655
+  to close        0.3801sd    0.0395sd    0.3406sd      [-1.063, +1.752]   0.6247
+
+  COHORT VOLATILITY PROFILE
+  COHORT          MEAN SCORE   MEAN 5m SD   RATIO vs BOTTOM
+  TOP                   63.3      0.3538%             1.55x
+  BOTTOM                10.9      0.2283%             1.00x
+  FAILED_GATE            0.0      0.3443%             1.51x
+
+====================================================================================
+  ROBUSTNESS  (primary horizon, volatility-normalised)
+====================================================================================
+
+  TIME SPLIT — look-ahead probe
+  PERIOD                     n(A)   n(B)    EDGE(A)    EDGE(B)       DiD        p
+  --------------------------------------------------------------------------------
+  first half (older)           32     18     0.321sd    -0.334sd    0.655sd   0.2808
+  second half (recent)         34     19     0.396sd    -0.657sd    1.053sd   0.0083
+
+  LEAVE-ONE-NAME-OUT
+    full sample DiD        0.860 sd
+    jackknife DiD range    0.607 .. 1.001 sd
+    significant (p<0.05) 19/20 drops
+    most influential:
+      without ECL    DiD  0.607 sd  p=0.0840
+      without KO     DiD  1.001 sd  p=0.0090
+      without MU     DiD  0.994 sd  p=0.0100
+
+====================================================================================
+  RANK CORRELATION — does a higher score mean a bigger edge?
+====================================================================================
+  names with >=2 signals: 14
+  Spearman rho(score, +30min edge) = +0.319   permutation p = 0.2714
+
+  SYM       SCORE  SIGNALS   EDGE +30m
+  VLO        67.4       12     0.0531%
+  MU         65.5       11    -0.2269%
+  NVDA       65.1       12     0.1699%
+  MPC        64.4        9     0.2356%
+  EOG        61.4        6     0.1511%
+  DD         60.1        6    -0.0730%
+  WDAY       60.1        4     0.7495%
+  AVGO       59.6        2     0.0418%
+  NXPI       58.1        4    -0.0346%
+  ECL        15.1        4    -0.4498%
+  CMG        14.5        3     0.1547%
+  KO         14.0       15    -0.0503%
+  LIN        13.6        6     0.0072%
+  HON         7.3        8    -0.0894%
+
+====================================================================================
+  PORTFOLIO BACKTEST PER COHORT  (same rules, same window)
+====================================================================================
+  COHORT          TRADES    WIN%      95% CI      NET $    NET %     PF  SHARPE   MAXDD
+  --------------------------------------------------------------------------------
+  TOP                 63   42.9%      31-55%     -37.95   -0.38%   0.96   -0.25   1.75%
+  BOTTOM              37   24.3%      13-40%    -403.69   -4.04%   0.35   -5.08   3.73%
+  FAILED_GATE         55   30.9%      20-44%    -613.90   -6.14%   0.40   -5.78   5.90%
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  HOW TO READ THIS
+  The DiD row at the PRIMARY horizon is the answer. Positive and
+  significant = the score carries information. Straddling zero = it does
+  not, on this evidence.
+  Four horizons are tested, so a Bonferroni-corrected threshold is
+  p < 0.0125. Secondary horizons clearing 0.05 but not 0.0125 are not
+  findings.
+  A null here is WEAK evidence of no effect, not proof of none: cohorts
+  of this size over 59 sessions can only detect a fairly large effect.
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

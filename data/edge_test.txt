@@ -1,0 +1,29 @@
+==============================================================================
+  SIGNAL EDGE TEST — breakout bars vs. all other cadence bars
+==============================================================================
+  Signal observations    176
+  Baseline observations  28,712
+  Friction hurdle        0.100%  (round-trip slippage)
+
+  HORIZON          SIGNAL   BASELINE       EDGE   p-value   VERDICT                 
+  --------------------------------------------------------------------------
+  +15 min         0.0546%   -0.0051%    0.0597%    0.0065   real but < costs        
+  +30 min         0.0558%   -0.0105%    0.0664%    0.0300   real but < costs        
+  +60 min         0.0493%   -0.0187%    0.0680%    0.1034   not significant         
+  to close       -0.0160%   -0.0769%    0.0609%    0.4198   not significant         
+  --------------------------------------------------------------------------
+
+  SIGNAL DISTRIBUTION
+    max favourable excursion (mean)    0.892%
+    median forward 30-min return       0.035%
+    share of signals green at +30m      54.5%
+    share of signals green at close     50.6%
+    signals per session (mean)          3.32
+
+  HOW TO READ THIS
+  'not significant'  — the breakout bar is indistinguishable from any
+                       other bar in the same window. No exit tuning
+                       rescues a signal with no forward information.
+  'real but < costs' — there IS an effect, but it is smaller than the
+                       friction of capturing it.
+  'tradeable'        — edge survives costs; exits are worth optimising.

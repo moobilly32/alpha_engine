@@ -1,0 +1,30 @@
+========================================================================================================
+  RUNNER-EXIT SWEEP — fixed 2.5R target vs fixed-percentage trailing stops
+========================================================================================================
+  Window 2026-06-17 -> 2026-09-10 (59 sessions) · 29 symbols · $10,000 · max 4 concurrent
+  Held constant: oversold entry (1h RSI<35/lower BB) · 2.5% fixed stop · sell 50% @ +1.0R, stop->breakeven
+
+  RUNNER EXIT                    TRADES   WIN%       NET $    NET %    MAXDD $  MAXDD %  AVG WIN $     PF   EXP R  vs BASE $
+  ----------------------------------------------------------------------------------------------------
+  Fixed 2.5R target (baseline)       67  52.2%      -10.69   -0.11%     527.93    5.26%     +58.43   0.99   0.003      +0.00
+  Trailing stop — 2.0% trail         85  55.3%     +231.63   +2.32%     388.99    3.86%     +57.75   1.09   0.046    +242.32
+  Trailing stop — 4.0% trail         63  49.2%     -555.59   -5.56%     495.11    4.93%     +47.33   0.73  -0.142    -544.90
+  Trailing stop — 6.0% trail         48  50.0%     -367.06   -3.67%     466.92    4.65%     +48.84   0.76  -0.122    -356.36
+  Trailing stop — 8.0% trail         40  47.5%     -529.49   -5.29%     568.72    5.67%     +43.00   0.61  -0.215    -518.79
+  ----------------------------------------------------------------------------------------------------
+  Unresolved-at-end trades excluded from every column above (open MTM per arm: 4@+21, 4@+5, 4@+178, 4@+220, 4@+326)
+
+  SPY buy & hold, same window: +2.28%  ($+228.42)
+  QQQ buy & hold, same window: -1.92%  ($-191.55)
+
+  EXIT-REASON MIX PER ARM
+    Fixed 2.5R target (baseline)   STOP 28, BE_STOP 17, TARGET 11, GAP_BE_STOP 5, GAP_STOP 2, PRE_EARNINGS 2, GAP_TARGET 2
+    Trailing stop — 2.0% trail     TRAIL_STOP 40, STOP 36, GAP_BE_STOP 7, GAP_STOP 2
+    Trailing stop — 4.0% trail     STOP 30, BE_STOP 12, TRAIL_STOP 11, GAP_BE_STOP 8, GAP_STOP 1, PRE_EARNINGS 1
+    Trailing stop — 6.0% trail     STOP 22, BE_STOP 11, GAP_BE_STOP 6, TRAIL_STOP 6, PRE_EARNINGS 2, GAP_STOP 1
+    Trailing stop — 8.0% trail     STOP 19, BE_STOP 10, GAP_BE_STOP 4, TRAIL_STOP 4, PRE_EARNINGS 2, GAP_STOP 1
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  VERDICT: No fixed-percentage trailing stop beat the fixed 2.5R target on net P&L.
+  This is a single 59-day in-sample window. Treat any edge as a hypothesis, not a result.
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

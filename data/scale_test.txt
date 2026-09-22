@@ -1,0 +1,63 @@
+========================================================================================================
+  HIGH-WIN-RATE MODIFICATIONS — 59-DAY SWING BACKTEST
+========================================================================================================
+  Window 2026-06-16 → 2026-09-09 (59 sessions) · 29 symbols · $10,000 · max 5 concurrent
+  Runner target 2.5R · scale sells 50% then stop → breakeven
+  Earnings: BLOCKED (no entry within 5d, exit before the print) · overnight gaps modelled
+
+  ENTRY     STOP       VARIANT       TRADES   WIN%    95% CI      NET $   NET %   MAXDD $  MAXDD%  SHARPE     PF   E[R]
+  ----------------------------------------------------------------------------------------------------
+  pullback  structure  no scaling       147  29.3%    23-37%     +95.75  +0.96%    495.63   4.80%    0.57   1.03  -0.02
+  pullback  structure  scale 1.00R      217  46.1%    40-53%    -472.60  -4.73%    507.16   5.10%   -1.73   0.85  -0.10
+  pullback  structure  scale 1.25R      205  39.5%    33-46%    -473.76  -4.74%    656.74   6.58%   -1.62   0.86  -0.11
+  pullback  structure  scale 1.50R      197  37.1%    31-44%    -422.27  -4.22%    621.22   6.16%   -1.35   0.88  -0.10
+  ----------------------------------------------------------------------------------------------------
+  pullback  2.0x ATR   no scaling        20  30.0%    15-52%    -173.55  -1.74%    743.54   7.28%    0.24   0.86  -0.09
+  pullback  2.0x ATR   scale 1.00R       24  50.0%    31-69%     +84.97  +0.85%    379.53   3.72%    1.22   1.08   0.03
+  pullback  2.0x ATR   scale 1.25R       22  40.9%    23-61%     -30.28  -0.30%    445.62   4.27%    0.93   0.97  -0.02
+  pullback  2.0x ATR   scale 1.50R       18  44.4%    25-66%     +83.34  +0.83%    337.47   3.30%    1.66   1.09   0.04
+  ----------------------------------------------------------------------------------------------------
+  oversold  structure  no scaling       159  26.4%    20-34%  -1,246.22 -12.46%  1,524.88  15.04%   -3.35   0.57  -0.24
+  oversold  structure  scale 1.00R      192  49.0%    42-56%    -645.39  -6.45%    784.21   7.74%   -1.89   0.73  -0.13
+  oversold  structure  scale 1.25R      186  42.5%    36-50%    -768.14  -7.68%    779.03   7.70%   -2.34   0.70  -0.16
+  oversold  structure  scale 1.50R      168  37.5%    31-45%    -607.45  -6.07%    750.96   7.42%   -1.50   0.75  -0.21
+  ----------------------------------------------------------------------------------------------------
+  oversold  2.0x ATR   no scaling        14  50.0%    27-73%    +615.54  +6.16%    434.75   3.96%    3.27   1.96   0.44
+  oversold  2.0x ATR   scale 1.00R       14  50.0%    27-73%    +377.70  +3.78%    317.31   2.96%    2.96   1.60   0.28
+  oversold  2.0x ATR   scale 1.25R       14  50.0%    27-73%    +443.07  +4.43%    318.28   2.96%    3.38   1.70   0.33
+  oversold  2.0x ATR   scale 1.50R       14  50.0%    27-73%    +535.33  +5.35%    319.69   2.95%    3.45   1.83   0.39
+  ----------------------------------------------------------------------------------------------------
+
+  DID SCALING HELP?  (each scaled variant vs. its own no-scaling baseline)
+  ENTRY     STOP       VARIANT         Δ WIN%    Δ NET $    Δ PF   Δ E[R]               VERDICT
+  --------------------------------------------------------------------------------------------
+  pullback  structure  scale 1.00R     +16.8%    -568.35   -0.18    -0.08     win% up, P&L DOWN
+  pullback  structure  scale 1.25R     +10.3%    -569.51   -0.17    -0.09     win% up, P&L DOWN
+  pullback  structure  scale 1.50R      +7.8%    -518.02   -0.16    -0.08     win% up, P&L DOWN
+  --------------------------------------------------------------------------------------------
+  pullback  2.0x ATR   scale 1.00R     +20.0%    +258.52   +0.22    +0.11        better on both
+  pullback  2.0x ATR   scale 1.25R     +10.9%    +143.27   +0.11    +0.06        better on both
+  pullback  2.0x ATR   scale 1.50R     +14.4%    +256.90   +0.23    +0.13        better on both
+  --------------------------------------------------------------------------------------------
+  oversold  structure  scale 1.00R     +22.5%    +600.83   +0.16    +0.11        better on both
+  oversold  structure  scale 1.25R     +16.1%    +478.08   +0.13    +0.08        better on both
+  oversold  structure  scale 1.50R     +11.1%    +638.77   +0.18    +0.03        better on both
+  --------------------------------------------------------------------------------------------
+  oversold  2.0x ATR   scale 1.00R      +0.0%    -237.84   -0.36    -0.17         worse on both
+  oversold  2.0x ATR   scale 1.25R      +0.0%    -172.47   -0.26    -0.12         worse on both
+  oversold  2.0x ATR   scale 1.50R      +0.0%     -80.21   -0.12    -0.05         worse on both
+  --------------------------------------------------------------------------------------------
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  Configurations reaching the 50%+ win-rate goal: 5/16
+    best P&L among them: oversold/2.0x ATR/no scaling — win 50.0%, net +615.54 (+6.16%), PF 1.96
+  Profitable configurations: 7/16
+    best P&L overall: oversold/2.0x ATR/no scaling — net +615.54 (+6.16%), win 50.0%, PF 1.96, E[R] 0.44, 14 trades
+  SPY buy & hold, same window: +1.67%
+  QQQ buy & hold, same window: -1.84%
+
+  Win rate here is NOT comparable across scaled and unscaled rows: scaling
+  converts would-be breakeven-or-worse trades into small winners, which
+  lifts win rate while capping the winners that pay for the losers. Judge
+  by NET, PF and E[R]. All of this is in-sample on one 59-day window.
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

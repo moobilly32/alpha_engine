@@ -1,0 +1,98 @@
+{
+  "AFRM": {
+    "broker_mode": "alpaca_paper",
+    "closed_at": null,
+    "entry_fill": 72.335,
+    "entry_limit": 72.335,
+    "entry_order_id": "e015c9ef-69b2-40e4-9d28-f4102feea798",
+    "history": [
+      {
+        "event": "ENTRY_SUBMITTED",
+        "limit": 72.335,
+        "order_id": "e015c9ef-69b2-40e4-9d28-f4102feea798",
+        "shares": 342.1146,
+        "ts": "2026-09-14T11:28:40-04:00"
+      },
+      {
+        "event": "ENTRY_FILLED",
+        "note": "inferred from price",
+        "price": 72.335,
+        "shares": 342.1146,
+        "ts": "2026-09-14T11:30:42-04:00"
+      },
+      {
+        "event": "STOP_PLACED",
+        "order_id": "c3326554-49f9-4e6f-80f5-c97f8735ee0e",
+        "stop": 70.53,
+        "ts": "2026-09-14T11:30:42-04:00"
+      }
+    ],
+    "meta": {
+      "scan_time": "2026-09-14T11:28:40.373650-04:00",
+      "signal_reason": "oversold",
+      "source": "intraday_oversold"
+    },
+    "opened_at": "2026-09-14T11:30:42-04:00",
+    "r_unit": 1.805,
+    "realized_pnl": 0.0,
+    "reason": null,
+    "scale_price": 74.14,
+    "scaled": false,
+    "shares_open": 342.1146,
+    "shares_total": 342.1146,
+    "status": "CLOSING",
+    "stop_order_id": "c3326554-49f9-4e6f-80f5-c97f8735ee0e",
+    "stop_price": 70.53,
+    "submitted_at": "2026-09-14T11:28:40-04:00",
+    "target_price": 76.85,
+    "ticker": "AFRM"
+  },
+  "UNH": {
+    "broker_mode": "alpaca_paper",
+    "closed_at": null,
+    "entry_fill": 384.44,
+    "entry_limit": 384.44,
+    "entry_order_id": "be33a5a9-3935-4ef6-b8a8-85da50f91cee",
+    "history": [
+      {
+        "event": "ENTRY_SUBMITTED",
+        "limit": 384.44,
+        "order_id": "be33a5a9-3935-4ef6-b8a8-85da50f91cee",
+        "shares": 64.3711,
+        "ts": "2026-09-14T11:28:40-04:00"
+      },
+      {
+        "event": "ENTRY_FILLED",
+        "note": "inferred from price",
+        "price": 384.44,
+        "shares": 64.3711,
+        "ts": "2026-09-14T11:32:55-04:00"
+      },
+      {
+        "event": "STOP_PLACED",
+        "order_id": "aafecf01-2654-4602-a616-76f1fb76748e",
+        "stop": 374.83,
+        "ts": "2026-09-14T11:32:55-04:00"
+      }
+    ],
+    "meta": {
+      "scan_time": "2026-09-14T11:28:40.373650-04:00",
+      "signal_reason": "oversold: prior close touched lower BB 382.45",
+      "source": "intraday_oversold"
+    },
+    "opened_at": "2026-09-14T11:32:55-04:00",
+    "r_unit": 9.61,
+    "realized_pnl": 0.0,
+    "reason": null,
+    "scale_price": 394.05,
+    "scaled": false,
+    "shares_open": 64.3711,
+    "shares_total": 64.3711,
+    "status": "CLOSING",
+    "stop_order_id": "aafecf01-2654-4602-a616-76f1fb76748e",
+    "stop_price": 374.83,
+    "submitted_at": "2026-09-14T11:28:40-04:00",
+    "target_price": 408.47,
+    "ticker": "UNH"
+  }
+}

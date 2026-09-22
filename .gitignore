@@ -1,0 +1,16 @@
+# Environment & Secret Keys
+.env
+*.env
+
+# Python Cache & Bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary Backups & Local State
+/tmp/
+data/*_bak.json
+
+# Execution Logs
+logs/
+*.log
