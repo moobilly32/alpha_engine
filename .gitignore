@@ -10,6 +10,10 @@ __pycache__/
 # Temporary Backups & Local State
 /tmp/
 data/*_bak.json
+data/hybrid_positions.json
+
+# Backtest data cache (regenerated from yfinance on demand, pure churn)
+.cache/
 
 # Execution Logs
 logs/
