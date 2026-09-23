@@ -16,6 +16,7 @@ Everything that touches yfinance goes through here, for three reasons:
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 import pickle
 import time
@@ -25,6 +26,7 @@ from typing import Any
 import logging
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 from config import CACHE, TZ
@@ -264,12 +266,22 @@ def sp500_symbols(ttl: float = 7 * 24 * 3600) -> list[str]:
     S&P 500 constituents from Wikipedia. Returns [] on any failure — the caller
     falls back to the built-in seed pool, so a Wikipedia layout change degrades
     the universe rather than breaking the run.
+
+    Fetches the page with `requests` (a real browser User-Agent) and hands
+    `pd.read_html` the HTML text rather than the URL — `read_html` sends no
+    User-Agent of its own, which Wikipedia's edge now answers with a 403
+    (confirmed: this silently returned [] on every call until fixed).
     """
 
     def _go():
         try:
-            tables = pd.read_html(
-                "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+            resp = requests.get(
+                "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X "
+                                       "10_15_7) AppleWebKit/537.36"},
+                timeout=15)
+            resp.raise_for_status()
+            tables = pd.read_html(io.StringIO(resp.text))
             for t in tables:
                 if "Symbol" in t.columns:
                     return [str(s).replace(".", "-").strip()

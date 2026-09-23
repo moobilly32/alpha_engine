@@ -565,11 +565,45 @@ EXPANDED_UNIVERSE_100 = [
     "NEE", "LIN",
 ]
 
+# 100 liquid US large-caps, HEAVILY WEIGHTED to Technology/Media/Telecom (62/100,
+# vs. EXPANDED_UNIVERSE_100's deliberately balanced ~37/100) — built to test
+# whether concentrating in high-beta TMT momentum names raises trade frequency
+# without the diversification EXPANDED_UNIVERSE_100 relies on. Every symbol
+# checked (not assumed) via data.daily_bars() for >=210 sessions of history
+# over the 2022-present backtest window before being kept: this caught EA
+# (down to a single trading day, 2026-08-04, on unusually heavy volume —
+# consistent with a take-private buyout closing) and IPG (zero rows —
+# consistent with the real Omnicom/Interpublic merger having closed) as
+# delisted by the current date; both were swapped for RBLX and FOXA
+# respectively after independently verifying those trade normally through
+# today.
+TMT_TECH = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "TSLA", "AVGO", "ORCL",
+    "CRM", "ADBE", "CSCO", "ACN", "AMD", "INTC", "QCOM", "TXN", "IBM", "NOW",
+    "INTU", "AMAT", "MU", "ADI", "LRCX", "KLAC", "SNPS", "CDNS", "PANW", "CRWD",
+    "FTNT", "ANET", "DELL", "HPQ", "HPE", "WDC", "STX", "MRVL", "ENPH", "FSLR",
+    "PLTR", "SNOW", "DDOG", "ZS", "NET", "MDB", "TEAM", "WDAY", "KEYS", "ROP",
+]
+TMT_MEDIA_TELECOM = [
+    "NFLX", "DIS", "CMCSA", "TMUS", "VZ", "CHTR", "T", "WBD", "RBLX", "TTWO",
+    "OMC", "FOXA",
+]
+TMT_DIVERSIFIED_FILL = [
+    "JPM", "BAC", "WFC", "GS", "MS", "V", "MA", "AXP",
+    "UNH", "LLY", "JNJ", "ABBV", "MRK", "PFE", "TMO", "ABT",
+    "HD", "MCD", "NKE", "SBUX", "WMT", "PG", "KO", "PEP",
+    "CAT", "BA", "HON", "UPS", "RTX", "GE",
+    "XOM", "CVX", "COP",
+    "LIN", "NEE", "COST", "TGT", "LOW",
+]
+TMT_HEAVY_UNIVERSE_100 = TMT_TECH + TMT_MEDIA_TELECOM + TMT_DIVERSIFIED_FILL
+
 UNIVERSES = {
     "Large-Cap": LARGE_CAP_UNIVERSE,
     "Small-Cap": SMALL_CAP_UNIVERSE,
     "Mixed": MIXED_UNIVERSE,
     "Expanded100": EXPANDED_UNIVERSE_100,
+    "TMT100": TMT_HEAVY_UNIVERSE_100,
 }
 
 

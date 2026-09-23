@@ -65,21 +65,60 @@ MIN_BARS_REQUIRED = ADX_PERCENTILE_WINDOW + 30   # ADX warmup + real buffer
 # ---------------------------------------------------------------- Step 2/3: sizing
 # Asymmetric risk: a DIP is a confirmed mean-reversion setup (oversold, prior
 # edge validated in Phase 1); a BREAKOUT is taken the moment it prints, with
-# no confirmation yet that the move continues, so it gets a much smaller risk
-# budget.
+# no confirmation yet that the move continues, so it gets a smaller risk
+# budget than DIP within the same regime.
 #
-# Step 3 aligns the stop with backtest.py's validated Fixed Hybrid exactly,
-# correcting Step 2's deliberate simplification (one unified 2.0x ATR stop
-# for both signal types):
+# Stop placement aligns with backtest.py's validated Fixed Hybrid exactly:
 #   DIP      — fixed STOP_PCT (2.5%, config.py — same constant Phase 1's
 #              backtest uses, not a second hand-typed 0.025) off entry.
 #              Also gets a TARGET_R (2.5R, config.py) profit target, since
 #              a fixed-% stop needs a defined R-unit to size a target off —
 #              BREAKOUT has no target, exiting purely via the trailing stop.
-#   BREAKOUT — 2.0x ATR14, unchanged from Step 2.
-RISK_PCT_DIP = 0.00625        # 0.625% of equity per DIP trade
-RISK_PCT_BREAKOUT = 0.0025    # 0.25% of equity per BREAKOUT trade
+#   BREAKOUT — 2.0x ATR14, unchanged.
 STOP_ATR_MULT = 2.0           # BREAKOUT initial stop = Entry - STOP_ATR_MULT x ATR14
+
+# ---- Widened Spread Regime Filter (permanent production config) -----------
+# Risk_pct is no longer a flat constant: it is selected live, per signal, by
+# whether SPY's last COMPLETED daily close is above its own rolling 50-day
+# SMA (current_spy_regime() below) — the same "Widened Spread" config
+# validated across hypothetical_backtester.py's regime-filter research this
+# session (best isolated backtest: ~+115% total return / ~9.8% max
+# drawdown / Sharpe ~1.2 over 2022-present, $100k, though never re-run
+# through the same live dry-run/fill-verification process the ORIGINAL
+# 0.625%/0.25% baseline went through before that one was cleared for
+# forward paper testing).
+REGIME_SMA_WINDOW = 50
+RISK_PCT_DIP_BULL = 0.0150         # 1.50% DIP when SPY > its 50-day SMA
+RISK_PCT_BREAKOUT_BULL = 0.0100    # 1.00% BREAKOUT when SPY > its 50-day SMA
+RISK_PCT_DIP_BEAR = 0.0050         # 0.50% DIP when SPY <= its 50-day SMA
+RISK_PCT_BREAKOUT_BEAR = 0.0025    # 0.25% BREAKOUT when SPY <= its 50-day SMA
+
+
+def current_spy_regime() -> str:
+    """
+    Live SPY 50-day SMA regime check — same non-repainting discipline as
+    the rest of this module (snapshot()/current_atr()): reads only the
+    last COMPLETED daily bar, never today's still-forming one. Returns
+    "BULL" if that close is above its own trailing REGIME_SMA_WINDOW-day
+    SMA, "BEAR" otherwise (a tie counts as BEAR, matching the backtest's
+    `<=` bear-regime convention exactly). Defensively returns "BEAR" — the
+    lower-risk regime — if SPY data can't be fetched or there isn't enough
+    history to compute the SMA, rather than risking the aggressive bull
+    sizing on missing/incomplete data.
+    """
+    try:
+        daily = data.daily_bars("SPY", period="6mo")
+    except Exception:
+        return "BEAR"
+    if daily.empty:
+        return "BEAR"
+    today = now_ny().date()
+    hist = daily[daily.index.date < today]
+    if len(hist) < REGIME_SMA_WINDOW:
+        return "BEAR"
+    close = hist["Close"].to_numpy(dtype=float)
+    sma = close[-REGIME_SMA_WINDOW:].mean()
+    return "BULL" if close[-1] > sma else "BEAR"
 
 
 @dataclass
@@ -252,10 +291,11 @@ SHARE_PRECISION = 6
 
 def size_order(snap: SymbolSnapshot, equity: float) -> HybridOrder | None:
     """
-    Step 3 asymmetric sizing: DIP risks RISK_PCT_DIP of equity off a fixed
-    STOP_PCT stop with a TARGET_R profit target; BREAKOUT risks the tighter
-    RISK_PCT_BREAKOUT off a STOP_ATR_MULT x ATR14 stop with no fixed target
-    (it exits via the trailing stop in --manage instead).
+    Widened Spread Regime Filter sizing: risk_pct is selected live by
+    current_spy_regime() — DIP risks RISK_PCT_DIP_BULL/BEAR off a fixed
+    STOP_PCT stop with a TARGET_R profit target; BREAKOUT risks
+    RISK_PCT_BREAKOUT_BULL/BEAR off a STOP_ATR_MULT x ATR14 stop with no
+    fixed target (it exits via the trailing stop in --manage instead).
 
     Shares = risk_dollars / (entry - stop), sized to a PRECISE FRACTIONAL
     quantity (rounded only to SHARE_PRECISION, never floored to a whole
@@ -272,15 +312,16 @@ def size_order(snap: SymbolSnapshot, equity: float) -> HybridOrder | None:
 
     entry = snap.price
     target: float | None = None
+    regime = current_spy_regime()
 
     if snap.mode == "DIP":
-        risk_pct = RISK_PCT_DIP
+        risk_pct = RISK_PCT_DIP_BULL if regime == "BULL" else RISK_PCT_DIP_BEAR
         stop = entry * (1.0 - STOP_PCT)
         risk_per_share = entry - stop
         if risk_per_share > 0:
             target = entry + risk_per_share * TARGET_R
     else:
-        risk_pct = RISK_PCT_BREAKOUT
+        risk_pct = RISK_PCT_BREAKOUT_BULL if regime == "BULL" else RISK_PCT_BREAKOUT_BEAR
         if snap.atr != snap.atr or snap.atr <= 0:      # NaN/invalid guard
             return None
         stop = entry - STOP_ATR_MULT * snap.atr

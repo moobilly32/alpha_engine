@@ -166,6 +166,31 @@ def compute_circuit_breaker_days(start: dt.date, end: dt.date) -> set[dt.date]:
     return {ts.date() for ts in w.index[drop > CIRCUIT_BREAKER_DROP_PCT]}
 
 
+def _compute_spy_trending_dates(start: dt.date, end: dt.date,
+                                sma_window: int = 200) -> set[dt.date]:
+    """
+    Simple, standard trend proxy, generalized by `sma_window`: a day
+    counts as "trending" if SPY's close is above its own rolling
+    `sma_window`-day SMA (computed on the full daily history, so the SMA
+    at day T never looks past day T — no forward-looking bias). Not a
+    sophisticated regime classifier, just a defensible standard reading of
+    "the broad market is in an established uptrend." Used two ways in this
+    file: the capital-velocity/cash-drag diagnostic (BlockStats.
+    avg_cash_pct_trending, sma_window=200, the default) and the
+    `regime_filter` risk-sizing gate (run_risk_managed_backtest,
+    sma_window=50 per that feature's spec).
+    """
+    spy = data.daily_bars("SPY", period="max")
+    if spy.empty:
+        return set()
+    close = spy["Close"].to_numpy(dtype=float)
+    sma = pd.Series(close).rolling(sma_window).mean().to_numpy()
+    is_trending = np.where(np.isnan(sma), False, close > sma)
+    dates = spy.index.date
+    return {d for d, t, in zip(dates, is_trending)
+           if t and start <= d <= end}
+
+
 @dataclass
 class BlockStats:
     breaker_days: int = 0
@@ -183,6 +208,18 @@ class BlockStats:
     zero_share_signals: int = 0
     realized_risk_pct_mr: list[float] = field(default_factory=list)
     realized_risk_pct_mom: list[float] = field(default_factory=list)
+    # Capital-velocity diagnostics (see run_risk_managed_backtest's
+    # max_concurrent docstring section and print_concurrency_sweep()):
+    # avg_open_positions is the mean count of simultaneously-held positions
+    # across the whole window, vs. max_concurrent_used (the cap actually in
+    # effect for this run). avg_cash_pct/_trending/_non_trending are the
+    # mean fraction of equity sitting in cash (not deployed), overall and
+    # split by a simple SPY-close-vs-200-day-SMA trend proxy.
+    avg_open_positions: float = 0.0
+    max_concurrent_used: int = 0
+    avg_cash_pct: float = 0.0
+    avg_cash_pct_trending: float = 0.0
+    avg_cash_pct_non_trending: float = 0.0
 
 
 # ---------------------------------------------------------------- the new engine
@@ -192,6 +229,14 @@ def run_risk_managed_backtest(symbols: list[str], start: dt.date, end: dt.date,
                               risk_pct_mr: float = RISK_PCT_MR,
                               risk_pct_mom: float = RISK_PCT_MOM,
                               fractional_shares: bool = False,
+                              max_concurrent: int = MAX_CONCURRENT,
+                              max_hold_days_stagnant: int | None = None,
+                              stagnant_min_progress_r: float = 0.5,
+                              regime_filter: dict | None = None,
+                              breakout_scale_out: dict | None = None,
+                              breakout_gate_symbols: set[str] | None = None,
+                              pyramid_config: dict | None = None,
+                              margin_multiplier: float = 1.0,
                               ) -> tuple["bt.HybridResult", BlockStats]:
     """
     Portfolio loop identical in shape/exit-mechanics to
@@ -233,7 +278,118 @@ def run_risk_managed_backtest(symbols: list[str], start: dt.date, end: dt.date,
     also changing its order type. This flag is a backtest research tool
     for measuring that gap's impact — not, by itself, a description of
     what's deployed today.
+
+    `max_concurrent` (default MAX_CONCURRENT — every existing caller keeps
+    this behavior unchanged) is the hard cap on simultaneously open
+    positions. Also drives two cash-utilization diagnostics recorded on
+    the returned BlockStats (see its fields): `avg_open_positions` (mean
+    concurrent positions actually held, vs. this cap) and
+    `avg_cash_pct`/`avg_cash_pct_trending`/`avg_cash_pct_non_trending`
+    (mean idle-cash fraction of equity, overall and split by whether SPY's
+    close was above its own 200-day SMA that day — a simple, standard
+    trend proxy, not a sophisticated regime classifier).
+
+    `max_hold_days_stagnant` (default None — off, every existing caller
+    unchanged): if set, ANY open position (MR or MOM) held
+    `max_hold_days_stagnant` CALENDAR days or more (matching this
+    codebase's existing `_age_days` convention in execution_engine.py,
+    not a trading-day count) that has NOT reached at least
+    `stagnant_min_progress_r` R-multiples of unrealized gain is
+    force-exited at that day's close, reason "STAGNANT_TIME_EXIT" — freeing
+    the capital/slot for a new signal rather than letting a going-nowhere
+    position sit. This is a genuinely new exit path, checked after the
+    existing stop/target/scale checks each day (a position that already
+    exited via stop/target/scale this same day is not double-counted).
+
+    `regime_filter` (default None — off, every existing caller unchanged):
+    a dict `{"sma_window": int, "aggressive": (risk_pct_mr, risk_pct_mom),
+    "base": (risk_pct_mr, risk_pct_mom)}`. When set, this REPLACES the
+    plain `risk_pct_mr`/`risk_pct_mom` arguments for sizing purposes: each
+    day is classified by whether SPY's close is above its own rolling
+    `sma_window`-day SMA (computed on real daily history, no
+    forward-looking bias) — the `aggressive` pair applies on days SPY is
+    above that SMA, the `base` pair otherwise. Existing positions are
+    unaffected by a regime change after entry; only NEW entries use the
+    day's regime-selected risk_pct.
+
+    `breakout_scale_out` (default None — off, every existing caller
+    unchanged): a dict `{"tranche_atr_mult": float, "trail_atr_mult_after_
+    scale": float}`. When set, MOM (BREAKOUT) trades gain a two-tranche
+    exit in place of the plain single ATR_TRAIL_MULT trailing stop:
+      Tranche 1 (SCALE_FRACTION, i.e. 50%, of the position): exits at a
+      FIXED price set once at entry — entry_px + tranche_atr_mult x the
+      ATR AT ENTRY (not recomputed daily) — and the stop on the remainder
+      moves to breakeven (entry_px), $0 risk, at that moment.
+      Tranche 2 (the remaining position): trails using
+      trail_atr_mult_after_scale (typically wider than ATR_TRAIL_MULT)
+      instead of ATR_TRAIL_MULT from that point on, ratcheting up-only
+      from the breakeven floor exactly like the existing trailing-stop
+      code (a wider multiplier can never ratchet the stop below wherever
+      it already is).
+    Reuses HybridTrade.target/.scaled (elsewhere documented "MR only") for
+    MOM bookkeeping when this feature is active — those fields are never
+    otherwise touched for MOM trades, so this can't collide with default
+    behavior when the feature is off.
+
+    `breakout_gate_symbols` (default None — off, every existing caller
+    unchanged): a set of symbols whose MOM/BREAKOUT candidates are ONLY
+    queued on a day SPY is in `regime_filter`'s bull/aggressive regime
+    (`sdate in regime_aggressive_dates`) — otherwise that symbol's
+    BREAKOUT signal is suppressed for the day, even if its own technicals
+    would normally qualify. DIP/MR signals for these symbols are
+    unaffected. Requires `regime_filter` to be set to mean anything (with
+    no regime_filter, `regime_aggressive_dates` is empty, so a gated
+    symbol's BREAKOUT would always be suppressed — a safe, if unhelpful,
+    default rather than an error). Built for testing whether admitting
+    leveraged benchmark ETFs (QLD/SSO) into the universe, but confining
+    them to bull-only BREAKOUT entries, adds edge without adding tail
+    risk during a bear/chop regime.
+
+    `pyramid_config` (default None — off, every existing caller unchanged):
+    a dict `{"trigger_atr_mult": float, "add_fraction": float}`. When a MOM
+    (BREAKOUT) trade's unrealized gain reaches entry_px + trigger_atr_mult
+    x ATR-AT-ENTRY (a fixed level, set once at entry, same convention as
+    breakout_scale_out's tranche target), a SECOND tranche of
+    `add_fraction` x the original share count is bought at that trigger
+    price (cash permitting — skipped, not forced, if unaffordable), and
+    the stop moves to the ORIGINAL (pre-add) entry price — the literal
+    "1st tranche to breakeven" request.
+
+    MODELING SIMPLIFICATION, disclosed rather than silently assumed: this
+    trade model has ONE stop for the WHOLE position, not independent stops
+    per tranche. After the add, `entry_px` is updated to the blended
+    (volume-weighted average) cost basis so that a LATER exit's P&L is
+    computed correctly across both tranches — but the single stop set to
+    the original entry price is not exactly "$0 risk" on the blended
+    position (tranche 2 was bought above the original entry, so a stop at
+    the original entry is a small loss on the blended total, not
+    breakeven on it). This is the closest defensible single-stop reading
+    of the request, not a perfect two-tranche simulation.
+
+    MUTUALLY EXCLUSIVE with `breakout_scale_out`: both reuse
+    HybridTrade.target/.scaled (elsewhere "MR only") for different
+    purposes and would conflict if both were set on the same call — this
+    function raises ValueError if both are given.
+
+    `margin_multiplier` (default 1.0 — no leverage, every existing caller
+    unchanged): relaxes the CASH affordability check on every new entry
+    (and a pyramid add) from `cost > cash` to
+    `cost > cash + equity x (margin_multiplier - 1.0)` — i.e. buying power
+    is equity x margin_multiplier, not cash alone, letting `cash` go
+    negative (a margin loan balance) up to that limit. Position SIZING
+    (risk_dollars = equity x risk_pct) is NOT affected by this — margin
+    only relaxes what the strategy can afford to buy with a given sizing
+    result, standard/prudent practice (risking a % of equity, not of
+    leveraged buying power). MODELING SIMPLIFICATION: margin interest/
+    financing cost on a negative cash balance is not modeled — this is
+    free leverage, which overstates real returns net of borrowing cost.
     """
+    if breakout_scale_out is not None and pyramid_config is not None:
+        raise ValueError("breakout_scale_out and pyramid_config cannot both be "
+                         "set — they reuse the same trade-level bookkeeping "
+                         "fields (HybridTrade.target/.scaled) for different, "
+                         "conflicting purposes")
+
     frames = _load_frames(symbols, start, end)
     res = bt.HybridResult(universe_name=UNIVERSE_NAME, mode="HYBRID", fixed=True,
                           start=start, end=end)
@@ -251,10 +407,17 @@ def run_risk_managed_backtest(symbols: list[str], start: dt.date, end: dt.date,
     stats.breaker_days = len(breaker_days & set(all_dates))
     stats.macro_days = len(FOMC_DATES & set(all_dates))
 
+    regime_aggressive_dates: set[dt.date] = set()
+    if regime_filter is not None:
+        regime_aggressive_dates = _compute_spy_trending_dates(
+            start, end, sma_window=regime_filter.get("sma_window", 50))
+
     cash = capital
     open_pos: dict[str, "bt.HybridTrade"] = {}
     pending_entries: list[tuple[str, str, dict | None]] = []
     equity_points: list[tuple[dt.date, float]] = []
+    cash_pct_points: list[tuple[dt.date, float]] = []   # cash / equity, per date
+    open_count_points: list[int] = []                   # concurrent open positions, per date
 
     def _mark(todays: dict) -> float:
         return cash + sum(
@@ -312,31 +475,90 @@ def run_risk_managed_backtest(symbols: list[str], start: dt.date, end: dt.date,
                     res.trades.append(t)
                     del open_pos[sym]
 
-            else:  # MOM: 2.0x ATR trailing stop, ratchet-up only
+            else:  # MOM: ATR trailing stop, ratchet-up only (+ optional
+                    # two-tranche scale-out, see breakout_scale_out docstring)
                 if l <= t.stop:
                     fill = apply_slippage(t.stop, "sell")
                     proceeds = fill * t.shares_open - COMMISSION_PER_TRADE
                     cash += proceeds
                     t.realized_pnl += proceeds - t.entry_px * t.shares_open
                     t.shares_open = 0.0
-                    t.exit_date, t.reason = sdate, "ATR_TRAIL_STOP"
+                    t.exit_date, t.reason = sdate, ("BE_STOP" if t.scaled else "ATR_TRAIL_STOP")
                     res.trades.append(t)
                     del open_pos[sym]
                     continue
 
+                trail_mult = bt.ATR_TRAIL_MULT
+
+                if (breakout_scale_out is not None and not t.scaled
+                        and t.target is not None and h >= t.target):
+                    scale_price = t.target
+                    qty = round(t.shares_total * SCALE_FRACTION, 6)
+                    fill = apply_slippage(scale_price, "sell")
+                    proceeds = fill * qty - COMMISSION_PER_TRADE
+                    cash += proceeds
+                    t.realized_pnl += proceeds - t.entry_px * qty
+                    t.shares_open = round(t.shares_open - qty, 6)
+                    t.scaled = True
+                    t.stop = t.entry_px    # breakeven on the remainder, $0 risk
+
+                if (pyramid_config is not None and not t.scaled
+                        and t.target is not None and h >= t.target):
+                    add_raw = t.shares_total * pyramid_config["add_fraction"]
+                    add_shares = add_raw if fractional_shares else math.floor(add_raw)
+                    if add_shares > 0:
+                        add_price = apply_slippage(t.target, "buy")
+                        add_cost = add_shares * add_price + COMMISSION_PER_TRADE
+                        buying_power = cash + _mark(todays) * (margin_multiplier - 1.0)
+                        if add_cost <= buying_power:
+                            cash -= add_cost
+                            original_entry_px = t.entry_px   # "1st tranche" breakeven level
+                            new_total = t.shares_open + add_shares
+                            # Blended cost basis so a LATER exit's realized_pnl
+                            # is computed correctly across both tranches — see
+                            # pyramid_config's MODELING SIMPLIFICATION note.
+                            t.entry_px = ((t.entry_px * t.shares_open + add_price * add_shares)
+                                         / new_total)
+                            t.shares_open = new_total
+                            t.shares_total = new_total
+                            t.stop = max(t.stop, original_entry_px)
+                    t.scaled = True   # pyramid opportunity used (or attempted) once, never again
+
+                if breakout_scale_out is not None and t.scaled:
+                    trail_mult = breakout_scale_out["trail_atr_mult_after_scale"]
+
                 atr_today = float(row["ATR14"])
-                if atr_today == atr_today:
+                if atr_today == atr_today and t.shares_open > 0:
                     t.high_water = max(t.high_water, h)
-                    new_stop = t.high_water - bt.ATR_TRAIL_MULT * atr_today
+                    new_stop = t.high_water - trail_mult * atr_today
                     if new_stop > t.stop:
                         t.stop = new_stop
+
+            # ---- Feature: 5-day (etc.) stagnant-time exit — checked AFTER
+            # the style-specific stop/target/scale logic above, so a
+            # position that already exited this same day is skipped (not
+            # in open_pos any more) rather than double-counted.
+            if sym in open_pos and max_hold_days_stagnant is not None:
+                days_held = (sdate - t.entry_date).days
+                if days_held >= max_hold_days_stagnant and t.r_unit > 0:
+                    current_close = float(row["Close"])
+                    unrealized_r = (current_close - t.entry_px) / t.r_unit
+                    if unrealized_r < stagnant_min_progress_r:
+                        fill = apply_slippage(current_close, "sell")
+                        proceeds = fill * t.shares_open - COMMISSION_PER_TRADE
+                        cash += proceeds
+                        t.realized_pnl += proceeds - t.entry_px * t.shares_open
+                        t.shares_open = 0.0
+                        t.exit_date, t.reason = sdate, "STAGNANT_TIME_EXIT"
+                        res.trades.append(t)
+                        del open_pos[sym]
 
         # ---- phase 2: fill yesterday's queued entries at TODAY's open —
         # FEATURE 1: asymmetric risk_pct_mr/risk_pct_mom sizing (matches the
         # Original Baseline's own split by default; see the risk_pct_mr/mom
         # docstring above).
         for sym, style, basis in pending_entries:
-            if sym in open_pos or len(open_pos) >= MAX_CONCURRENT:
+            if sym in open_pos or len(open_pos) >= max_concurrent:
                 continue
             row = todays.get(sym)
             if row is None:
@@ -354,7 +576,26 @@ def run_risk_managed_backtest(symbols: list[str], start: dt.date, end: dt.date,
             if fill <= stop:
                 continue
             eq = _mark(todays)
-            risk_pct = risk_pct_mr if style == "MR" else risk_pct_mom
+            if regime_filter is not None:
+                in_bull = sdate in regime_aggressive_dates
+                pair = regime_filter["aggressive"] if in_bull else regime_filter["base"]
+                risk_pct = pair[0] if style == "MR" else pair[1]
+                # ADX-conviction tiering: MOM (BREAKOUT) only, and only in the
+                # bull/aggressive regime — a DIP/MR entry's ADX is always
+                # < ADX_RANGE_MAX (20) by construction (that's the ranging-
+                # regime eligibility rule), so it can never reach a >35/>45
+                # conviction threshold; these tiers are structurally
+                # unreachable for MR and are not applied to it.
+                tiers = regime_filter.get("conviction_tiers_mom")
+                if tiers and in_bull and style == "MOM" and basis is not None:
+                    entry_adx = basis.get("adx")
+                    if entry_adx is not None:
+                        for threshold, multiplier in tiers:   # highest threshold first
+                            if entry_adx > threshold:
+                                risk_pct = pair[1] * multiplier
+                                break
+            else:
+                risk_pct = risk_pct_mr if style == "MR" else risk_pct_mom
             r_unit = fill - stop
             raw_shares = (eq * risk_pct) / r_unit
             shares = raw_shares if fractional_shares else math.floor(raw_shares)
@@ -362,13 +603,31 @@ def run_risk_managed_backtest(symbols: list[str], start: dt.date, end: dt.date,
                 stats.zero_share_signals += 1
                 continue
             cost = shares * fill + COMMISSION_PER_TRADE
-            if cost > cash:
+            buying_power = cash + eq * (margin_multiplier - 1.0)
+            if cost > buying_power:
                 continue
             cash -= cost
             realized_risk_pct = (shares * r_unit) / eq
             (stats.realized_risk_pct_mr if style == "MR"
             else stats.realized_risk_pct_mom).append(realized_risk_pct)
-            target = fill + r_unit * TARGET_R if style == "MR" else None
+            if style == "MR":
+                target = fill + r_unit * TARGET_R
+            elif breakout_scale_out is not None:
+                # Tranche 1's FIXED exit level, set once at entry off the
+                # ATR AT ENTRY (basis["atr"]) — not recomputed daily, matching
+                # "fixed +1.5x ATR gain." Reuses HybridTrade.target/.scaled
+                # (documented "MR only" elsewhere in this file) since MOM
+                # never otherwise sets them — see run_risk_managed_backtest's
+                # breakout_scale_out docstring.
+                target = fill + breakout_scale_out["tranche_atr_mult"] * basis["atr"]
+            elif pyramid_config is not None:
+                # Pyramid-add trigger price, FIXED at entry off the ATR AT
+                # ENTRY — see pyramid_config's docstring. Same field reuse as
+                # breakout_scale_out, mutually exclusive with it (enforced
+                # above).
+                target = fill + pyramid_config["trigger_atr_mult"] * basis["atr"]
+            else:
+                target = None
             open_pos[sym] = bt.HybridTrade(
                 symbol=sym, style=style, entry_date=sdate, entry_px=fill,
                 shares_total=shares, shares_open=shares, stop=stop,
@@ -401,8 +660,19 @@ def run_risk_managed_backtest(symbols: list[str], start: dt.date, end: dt.date,
                 atr_v = float(row["ATR14"])
                 if atr_v != atr_v:
                     style = None
+                elif (breakout_gate_symbols and sym in breakout_gate_symbols
+                     and sdate not in regime_aggressive_dates):
+                    # This symbol's BREAKOUT signals are confined to bull-
+                    # regime days only (breakout_gate_symbols) — a normally-
+                    # qualifying setup outside the bull regime is suppressed,
+                    # not queued. DIP/MR for this symbol is untouched.
+                    style = None
                 else:
-                    basis = {"high": float(row["High"]), "atr": atr_v}
+                    # adx_v carried through so phase 2 can apply ADX-conviction
+                    # risk tiering (regime_filter["conviction_tiers_mom"]) at
+                    # fill time — the entry's own ADX reading, from the signal
+                    # day, not looked up again at fill.
+                    basis = {"high": float(row["High"]), "atr": atr_v, "adx": adx_v}
             if style:
                 candidates.append((sym, style, basis))
 
@@ -416,7 +686,10 @@ def run_risk_managed_backtest(symbols: list[str], start: dt.date, end: dt.date,
             mom_c.sort(key=lambda x: (lambda v: -v if v == v else 0.0)(float(todays[x[0]]["ADX"])))
             pending_entries = mr_c + mom_c
 
-        equity_points.append((sdate, _mark(todays)))
+        today_equity = _mark(todays)
+        equity_points.append((sdate, today_equity))
+        cash_pct_points.append((sdate, cash / today_equity if today_equity > 0 else 0.0))
+        open_count_points.append(len(open_pos))
 
     # force-close anything still open at the end of the window
     for sym, t in list(open_pos.items()):
@@ -432,6 +705,20 @@ def run_risk_managed_backtest(symbols: list[str], start: dt.date, end: dt.date,
         equity_points[-1] = (equity_points[-1][0], cash)
 
     res.equity = pd.Series(dict(equity_points)).sort_index()
+
+    stats.max_concurrent_used = max_concurrent
+    stats.avg_open_positions = (sum(open_count_points) / len(open_count_points)
+                                if open_count_points else 0.0)
+    if cash_pct_points:
+        trending_dates = _compute_spy_trending_dates(start, end)
+        stats.avg_cash_pct = sum(p for _, p in cash_pct_points) / len(cash_pct_points)
+        trend_vals = [p for d, p in cash_pct_points if d in trending_dates]
+        non_trend_vals = [p for d, p in cash_pct_points if d not in trending_dates]
+        stats.avg_cash_pct_trending = (sum(trend_vals) / len(trend_vals)
+                                       if trend_vals else float("nan"))
+        stats.avg_cash_pct_non_trending = (sum(non_trend_vals) / len(non_trend_vals)
+                                           if non_trend_vals else float("nan"))
+
     return res, stats
 
 
@@ -597,6 +884,815 @@ def run_fractional_share_comparison(capital: float = 1_900.0) -> None:
     metrics_b = compute_metrics(res_b, capital)
 
     print_fractional_comparison(metrics_a, stats_a, metrics_b, stats_b, capital)
+
+
+AGGRESSIVE_RISK_TIERS: list[tuple[str, float, float]] = [
+    # (label, risk_pct_mr [DIP], risk_pct_mom [BREAKOUT])
+    ("Tier 1: 0.50% BREAKOUT / 1.00% DIP", 0.0100, 0.0050),
+    ("Tier 2: 0.75% BREAKOUT / 1.50% DIP", 0.0150, 0.0075),
+    ("Tier 3: 1.00% BREAKOUT / 2.00% DIP", 0.0200, 0.0100),
+]
+
+
+def print_aggressive_risk_sweep(results: list[tuple[str, dict]], capital: float) -> None:
+    width = 90
+    print("=" * width)
+    print("AGGRESSIVE LINEAR RISK SCALING SWEEP")
+    print(f"${capital:,.0f} starting capital, Mixed universe (30 symbols), "
+         f"MAX_CONCURRENT={MAX_CONCURRENT}, {START} -> {END}")
+    print("Whole-share sizing, FOMC blackout active, circuit breaker disabled "
+         "(daily-bar proxy over-blocks — established finding)")
+    print(f"Reference — current production tiers: DIP {RISK_PCT_MR*100:.3f}% / "
+         f"BREAKOUT {RISK_PCT_MOM*100:.3f}%")
+    print("=" * width)
+    header = (f"{'Tier':<38}{'Total Ret':>12}{'CAGR':>10}{'Max DD':>10}"
+             f"{'Sharpe':>9}{'Trades':>9}")
+    print(header)
+    print("-" * width)
+    for label, m in results:
+        print(f"{label:<38}{m['total_return_pct']:>+11.2f}%{m['ann_return_pct']:>+9.2f}%"
+             f"{m['max_dd_pct']:>9.2f}%{m['sharpe']:>9.3f}{m['n_trades']:>9}")
+    print("=" * width)
+
+
+def run_aggressive_risk_sweep(capital: float = 100_000.0) -> list[tuple[str, dict]]:
+    """
+    Parameter sweep: three "aggressive linear risk scaling" tiers of
+    risk_pct_mr (DIP) / risk_pct_mom (BREAKOUT), each run through
+    run_risk_managed_backtest() with the production config otherwise
+    unchanged (FOMC blackout active, circuit breaker disabled per the
+    established daily-bar over-blocking finding, whole-share sizing —
+    fractional_shares defaults to False), full 2022-present window.
+
+    Uses capital=$100,000 by default, NOT this file's current
+    STARTING_CAPITAL module constant (currently $1,500, left over from an
+    earlier small-account diagnostic task) — deliberately, so this sweep
+    isolates the effect of risk_pct scaling alone rather than being
+    confounded by the whole-share-rounding/zero-share-skip effects a
+    small account introduces (already characterized separately).
+    """
+    symbols = bt.UNIVERSES[UNIVERSE_NAME]
+    results: list[tuple[str, dict]] = []
+    for label, risk_pct_mr, risk_pct_mom in AGGRESSIVE_RISK_TIERS:
+        print(f"{label}: {START} -> {END} ...", flush=True)
+        res, _stats = run_risk_managed_backtest(
+            symbols, START, END, capital, use_circuit_breaker=False,
+            risk_pct_mr=risk_pct_mr, risk_pct_mom=risk_pct_mom,
+            fractional_shares=False)
+        results.append((label, compute_metrics(res, capital)))
+
+    print_aggressive_risk_sweep(results, capital)
+    return results
+
+
+def print_universe_expansion_comparison(baseline_metrics: dict, tmt_metrics: dict,
+                                        capital: float) -> None:
+    width = 78
+    print("=" * width)
+    print("30-SYMBOL BASELINE (Mixed) vs 100-SYMBOL TMT-HEAVY UNIVERSE")
+    print(f"${capital:,.0f} starting capital, risk UNCHANGED (DIP {RISK_PCT_MR*100:.3f}% / "
+         f"BREAKOUT {RISK_PCT_MOM*100:.3f}%), {START} -> {END}")
+    print("=" * width)
+    print(f"{'Metric':<28}{'30-Symbol Baseline':>24}{'100-Symbol TMT-Heavy':>26}")
+    print("-" * width)
+    print(f"{'Total Return (%)':<28}{baseline_metrics['total_return_pct']:>+23.2f}%"
+         f"{tmt_metrics['total_return_pct']:>+25.2f}%")
+    print(f"{'Max Drawdown (%)':<28}{baseline_metrics['max_dd_pct']:>23.2f}%"
+         f"{tmt_metrics['max_dd_pct']:>25.2f}%")
+    print(f"{'Sharpe Ratio':<28}{baseline_metrics['sharpe']:>24.3f}"
+         f"{tmt_metrics['sharpe']:>26.3f}")
+    print(f"{'Total Trades Executed':<28}{baseline_metrics['n_trades']:>24}"
+         f"{tmt_metrics['n_trades']:>26}")
+    print("=" * width)
+
+
+def run_universe_expansion_comparison(capital: float = 100_000.0) -> None:
+    """
+    Compares the original 30-symbol Mixed universe against the new
+    100-symbol TMT-heavy universe (backtest.TMT_HEAVY_UNIVERSE_100, 62%
+    Technology/Media/Telecom), same production risk config held
+    UNCHANGED (RISK_PCT_MR/RISK_PCT_MOM, FOMC blackout active, circuit
+    breaker disabled per the established daily-bar over-blocking finding,
+    whole-share sizing), same $capital, same 2022-present window — the
+    only variable is which symbols are in the tradeable universe.
+    """
+    print(f"30-symbol baseline (Mixed): {START} -> {END} ...", flush=True)
+    baseline_res, _ = run_risk_managed_backtest(
+        bt.UNIVERSES["Mixed"], START, END, capital, use_circuit_breaker=False,
+        risk_pct_mr=RISK_PCT_MR, risk_pct_mom=RISK_PCT_MOM,
+        fractional_shares=False)
+
+    print(f"100-symbol TMT-heavy universe: {START} -> {END} ...", flush=True)
+    tmt_res, _ = run_risk_managed_backtest(
+        bt.UNIVERSES["TMT100"], START, END, capital, use_circuit_breaker=False,
+        risk_pct_mr=RISK_PCT_MR, risk_pct_mom=RISK_PCT_MOM,
+        fractional_shares=False)
+
+    baseline_metrics = compute_metrics(baseline_res, capital)
+    tmt_metrics = compute_metrics(tmt_res, capital)
+
+    print_universe_expansion_comparison(baseline_metrics, tmt_metrics, capital)
+
+
+CONCURRENCY_TIERS: list[int] = [6, 8, 10]
+
+
+def print_concurrency_sweep(results: list[tuple[int, dict, BlockStats]],
+                            baseline_metrics: dict, baseline_stats: BlockStats,
+                            capital: float) -> None:
+    width = 100
+    print("=" * width)
+    print("CAPITAL VELOCITY SWEEP — MAX_CONCURRENT at 4 (baseline), 6, 8, 10")
+    print(f"${capital:,.0f} starting capital, Mixed universe (30 symbols), risk UNCHANGED "
+         f"(DIP {RISK_PCT_MR*100:.3f}% / BREAKOUT {RISK_PCT_MOM*100:.3f}%), {START} -> {END}")
+    print("Idle-cash % is the mean fraction of equity NOT deployed in an open position; "
+         "'trending' = SPY close > its own 200-day SMA that day")
+    print("=" * width)
+    header = (f"{'MAX_CONCURRENT':<16}{'Total Ret':>11}{'Max DD':>9}{'Sharpe':>8}"
+             f"{'Trades':>8}{'Avg Open':>10}{'Idle$ All':>10}{'Idle$ Trend':>12}"
+             f"{'Idle$ Non-T':>12}")
+    print(header)
+    print("-" * width)
+
+    def _row(tag: str, m: dict, s: BlockStats):
+        tr = "n/a" if s.avg_cash_pct_trending != s.avg_cash_pct_trending else f"{s.avg_cash_pct_trending*100:.1f}%"
+        nt = "n/a" if s.avg_cash_pct_non_trending != s.avg_cash_pct_non_trending else f"{s.avg_cash_pct_non_trending*100:.1f}%"
+        print(f"{tag:<16}{m['total_return_pct']:>+10.2f}%{m['max_dd_pct']:>8.2f}%"
+             f"{m['sharpe']:>8.3f}{m['n_trades']:>8}{s.avg_open_positions:>10.2f}"
+             f"{s.avg_cash_pct*100:>9.1f}%{tr:>12}{nt:>12}")
+
+    _row(f"4 (baseline)", baseline_metrics, baseline_stats)
+    for mc, m, s in results:
+        _row(str(mc), m, s)
+    print("=" * width)
+
+
+def run_concurrency_sweep(capital: float = 100_000.0) -> list[tuple[int, dict, BlockStats]]:
+    """
+    Capital-velocity sweep: MAX_CONCURRENT at 6, 8, and 10, against the
+    MAX_CONCURRENT=4 baseline, with risk parameters and universe held
+    UNCHANGED (RISK_PCT_MR/RISK_PCT_MOM, Mixed 30-symbol universe, FOMC
+    blackout active, circuit breaker disabled per the established
+    daily-bar over-blocking finding, whole-share sizing). Full
+    2022-present window, same $capital throughout.
+
+    Reports, per tier: Total Return, Max Drawdown, Sharpe, trade count,
+    average concurrent open positions (vs. the cap), and average idle-cash
+    percentage of equity — overall, and split into SPY-trending vs.
+    non-trending days (see _compute_spy_trending_dates()) to answer
+    specifically whether loosening the concurrency cap reduces unused
+    cash drag during trending regimes, or whether the extra slots simply
+    go unfilled.
+    """
+    symbols = bt.UNIVERSES["Mixed"]
+
+    print(f"Baseline (MAX_CONCURRENT=4): {START} -> {END} ...", flush=True)
+    baseline_res, baseline_stats = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        risk_pct_mr=RISK_PCT_MR, risk_pct_mom=RISK_PCT_MOM,
+        fractional_shares=False, max_concurrent=MAX_CONCURRENT)
+    baseline_metrics = compute_metrics(baseline_res, capital)
+
+    results: list[tuple[int, dict, BlockStats]] = []
+    for mc in CONCURRENCY_TIERS:
+        print(f"MAX_CONCURRENT={mc}: {START} -> {END} ...", flush=True)
+        res, stats = run_risk_managed_backtest(
+            symbols, START, END, capital, use_circuit_breaker=False,
+            risk_pct_mr=RISK_PCT_MR, risk_pct_mom=RISK_PCT_MOM,
+            fractional_shares=False, max_concurrent=mc)
+        results.append((mc, compute_metrics(res, capital), stats))
+
+    print_concurrency_sweep(results, baseline_metrics, baseline_stats, capital)
+    return results
+
+
+def _time_to_reach(equity: pd.Series, target: float) -> tuple[str, dt.date | None]:
+    """
+    Finds the first date the ACTUAL simulated equity curve closes at or
+    above `target` — not a CAGR-based extrapolation, which would smooth
+    over the real path's drawdowns and trade-timing variance and could
+    over- or understate how long this specific run actually took. Returns
+    (human-readable description, the crossing date — or None if `target`
+    is never reached within the simulated window at all).
+    """
+    if equity.empty:
+        return "n/a (no equity data)", None
+    start_date = equity.index[0]
+    hits = equity[equity >= target]
+    if hits.empty:
+        elapsed_days = (equity.index[-1] - start_date).days
+        return (f"NOT REACHED within the simulated window (final equity "
+               f"${equity.iloc[-1]:,.2f} after {elapsed_days} days / "
+               f"{elapsed_days / 365.25:.2f} years simulated)"), None
+    hit_date = hits.index[0]
+    elapsed_days = (hit_date - start_date).days
+    years = elapsed_days / 365.25
+    months = elapsed_days / 30.4368
+    return (f"{hit_date} — {elapsed_days} days ({months:.1f} months / "
+           f"{years:.2f} years) after {start_date}"), hit_date
+
+
+def run_sprint_phase_test(capital: float = 1_900.0, target: float = 5_000.0) -> dict:
+    """
+    Targeted single-configuration backtest: the "Sprint Phase" combination
+    of Tier-1 aggressive risk (1.00% DIP / 0.50% BREAKOUT — the one tier
+    from the earlier aggressive-risk sweep that beat the production
+    baseline on both Sharpe and total return, at the cost of higher
+    drawdown), MAX_CONCURRENT=6 (the best-performing tier from the earlier
+    concurrency sweep), fractional-share sizing, and the standard
+    30-symbol Mixed universe. FOMC blackout active; circuit breaker
+    disabled per the established daily-bar over-blocking finding. Full
+    2022-present window, $capital starting capital.
+
+    Also reports the time to grow from $capital to $target, read directly
+    off the equity curve's first crossing (see _time_to_reach()) — a real
+    simulated result, not a smoothed CAGR projection.
+    """
+    symbols = bt.UNIVERSES["Mixed"]
+    risk_pct_mom = 0.0050   # 0.50% BREAKOUT
+    risk_pct_mr = 0.0100    # 1.00% DIP
+
+    print(f"Sprint Phase config: {START} -> {END} ...", flush=True)
+    res, stats = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        risk_pct_mr=risk_pct_mr, risk_pct_mom=risk_pct_mom,
+        fractional_shares=True, max_concurrent=6)
+    metrics = compute_metrics(res, capital)
+    time_desc, _hit_date = _time_to_reach(res.equity, target)
+
+    width = 78
+    print("=" * width)
+    print("SPRINT PHASE CONFIGURATION — TARGETED BACKTEST")
+    print(f"${capital:,.0f} starting capital, Mixed universe (30 symbols), "
+         f"MAX_CONCURRENT=6, fractional shares, {START} -> {END}")
+    print(f"Risk: DIP {risk_pct_mr*100:.2f}% / BREAKOUT {risk_pct_mom*100:.2f}%  "
+         f"(FOMC blackout active, circuit breaker disabled)")
+    print("=" * width)
+    print(f"{'Total Return':<24}{metrics['total_return_pct']:>+10.2f}%")
+    print(f"{'CAGR (Annualized)':<24}{metrics['ann_return_pct']:>+10.2f}%")
+    print(f"{'Max Drawdown':<24}{metrics['max_dd_pct']:>10.2f}%")
+    print(f"{'Sharpe Ratio':<24}{metrics['sharpe']:>10.3f}")
+    print(f"{'Total Trades':<24}{metrics['n_trades']:>10}")
+    print("-" * width)
+    print(f"Time to grow ${capital:,.0f} -> ${target:,.0f}: {time_desc}")
+    print("=" * width)
+    return metrics
+
+
+def print_velocity_modifications(results: list[tuple[str, dict]], capital: float) -> None:
+    width = 96
+    print("=" * width)
+    print("VELOCITY MODIFICATIONS — 30-symbol Mixed universe, MAX_CONCURRENT=6")
+    print(f"${capital:,.0f} starting capital, {START} -> {END}, FOMC blackout active, "
+         f"circuit breaker disabled")
+    print("Goal: CAGR > 20% while Max Drawdown stays under 15%")
+    print("=" * width)
+    header = f"{'Test':<44}{'Total Ret':>11}{'CAGR':>9}{'Max DD':>9}{'Sharpe':>8}{'Trades':>8}"
+    print(header)
+    print("-" * width)
+    for label, m in results:
+        goal_hit = " <=20%CAGR/<15%DD" if (m['ann_return_pct'] > 20 and m['max_dd_pct'] < 15) else ""
+        print(f"{label:<44}{m['total_return_pct']:>+10.2f}%{m['ann_return_pct']:>+8.2f}%"
+             f"{m['max_dd_pct']:>8.2f}%{m['sharpe']:>8.3f}{m['n_trades']:>8}")
+    print("=" * width)
+
+
+def run_velocity_modifications(capital: float = 100_000.0) -> list[tuple[str, dict]]:
+    """
+    Tests three proposed "velocity" mechanisms against a fresh
+    MAX_CONCURRENT=6 baseline, all in the SAME run (so all four rows share
+    one data-fetch generation and are internally comparable, even though
+    yfinance's own historical data can drift slightly between sessions —
+    see this feature's regression check for why that matters).
+
+    1. A 5-day stagnant-time exit (max_hold_days_stagnant=5,
+       stagnant_min_progress_r=0.5 default): force-exits any position held
+       >=5 calendar days that hasn't reached +0.5R of unrealized gain.
+       Base production risk (RISK_PCT_MR/RISK_PCT_MOM) held constant so
+       this isolates the mechanism's own effect.
+    2. ATR trailing stop on BREAKOUT "instead of fixed targets" — ALREADY
+       this engine's existing, unconditional BREAKOUT behavior (2.0x
+       ATR14 trailing stop, target=None for MOM style; see
+       run_risk_managed_backtest's phase-1 code). No code change applies
+       here; this row reproduces the plain MAX_CONCURRENT=6 baseline
+       exactly, flagged rather than silently re-labeled as something new.
+    3. A 50-day-SMA market regime filter: 1.25% DIP / 0.75% BREAKOUT risk
+       when SPY closes above its own 50-day SMA, reverting to 0.50% DIP /
+       0.25% BREAKOUT otherwise (regime_filter param).
+
+    All four rows: Mixed universe (30 symbols), MAX_CONCURRENT=6, FOMC
+    blackout active, circuit breaker disabled (established daily-bar
+    over-blocking finding), whole-share sizing, full 2022-present window.
+    """
+    symbols = bt.UNIVERSES["Mixed"]
+    results: list[tuple[str, dict]] = []
+
+    print(f"Baseline (MAX_CONCURRENT=6, no new features): {START} -> {END} ...", flush=True)
+    res, _ = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        risk_pct_mr=RISK_PCT_MR, risk_pct_mom=RISK_PCT_MOM,
+        fractional_shares=False, max_concurrent=6)
+    results.append(("Baseline (MC=6, production risk)", compute_metrics(res, capital)))
+
+    print(f"Test 1: 5-day stagnant-time exit: {START} -> {END} ...", flush=True)
+    res, _ = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        risk_pct_mr=RISK_PCT_MR, risk_pct_mom=RISK_PCT_MOM,
+        fractional_shares=False, max_concurrent=6,
+        max_hold_days_stagnant=5, stagnant_min_progress_r=0.5)
+    results.append(("Test 1: 5-day stagnant-time exit", compute_metrics(res, capital)))
+
+    print(f"Test 2: BREAKOUT ATR trailing (already default): {START} -> {END} ...", flush=True)
+    res, _ = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        risk_pct_mr=RISK_PCT_MR, risk_pct_mom=RISK_PCT_MOM,
+        fractional_shares=False, max_concurrent=6)
+    results.append(("Test 2: BREAKOUT ATR trail (no change — already default)",
+                    compute_metrics(res, capital)))
+
+    print(f"Test 3: 50-day SMA regime filter: {START} -> {END} ...", flush=True)
+    res, _ = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=False, max_concurrent=6,
+        regime_filter={"sma_window": 50, "aggressive": (0.0125, 0.0075),
+                      "base": (0.0050, 0.0025)})
+    results.append(("Test 3: 50-day SMA regime filter", compute_metrics(res, capital)))
+
+    print_velocity_modifications(results, capital)
+    return results
+
+
+def run_tier1_regime_combo(capital: float = 100_000.0) -> dict:
+    """
+    Iterates on Test 3 (the 50-day SMA regime filter — the one velocity
+    mechanism that improved on baseline without adding drawdown) by
+    replacing its two risk pairs with the Tier-1 aggressive risk
+    (bull regime: 1.00% DIP / 0.50% BREAKOUT, the best-performing tier
+    from the earlier aggressive-risk sweep) and the actual production
+    baseline (bear/chop regime: RISK_PCT_MR/RISK_PCT_MOM = 0.625% DIP /
+    0.25% BREAKOUT), rather than Test 3's own milder 1.25%/0.50% pair.
+    MAX_CONCURRENT=6, Mixed 30-symbol universe, FOMC blackout active,
+    circuit breaker disabled (established daily-bar over-blocking
+    finding), whole-share sizing, full 2022-present window.
+    """
+    symbols = bt.UNIVERSES["Mixed"]
+    print(f"Tier-1/Regime combo: {START} -> {END} ...", flush=True)
+    res, _ = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=False, max_concurrent=6,
+        regime_filter={"sma_window": 50,
+                      "aggressive": (0.0100, 0.0050),   # bull: 1.00% DIP / 0.50% BREAKOUT
+                      "base": (RISK_PCT_MR, RISK_PCT_MOM)})  # bear/chop: 0.625% DIP / 0.25% BREAKOUT
+    metrics = compute_metrics(res, capital)
+
+    goal_hit = metrics["ann_return_pct"] > 20 and metrics["max_dd_pct"] < 15
+    width = 78
+    print("=" * width)
+    print("TIER-1 RISK x 50-DAY SMA REGIME FILTER — COMBINED TEST")
+    print(f"${capital:,.0f} starting capital, Mixed universe (30 symbols), "
+         f"MAX_CONCURRENT=6, {START} -> {END}")
+    print("Bull (SPY > 50d SMA): DIP 1.00% / BREAKOUT 0.50%   "
+         "Bear/Chop (SPY <= 50d SMA): DIP 0.625% / BREAKOUT 0.25%")
+    print("=" * width)
+    print(f"{'Total Return':<24}{metrics['total_return_pct']:>+10.2f}%")
+    print(f"{'CAGR (Annualized)':<24}{metrics['ann_return_pct']:>+10.2f}%")
+    print(f"{'Max Drawdown':<24}{metrics['max_dd_pct']:>10.2f}%")
+    print(f"{'Sharpe Ratio':<24}{metrics['sharpe']:>10.3f}")
+    print(f"{'Total Trades':<24}{metrics['n_trades']:>10}")
+    print("-" * width)
+    print(f"Goal (CAGR>20% AND MaxDD<15%): {'MET' if goal_hit else 'NOT MET'}")
+    print("=" * width)
+    return metrics
+
+
+def run_widened_regime_spread(capital: float = 100_000.0) -> dict:
+    """
+    Widens Test 3's regime spread: bull-regime risk raised from Test 3's
+    1.25% DIP / 0.75% BREAKOUT to 1.50% DIP / 1.00% BREAKOUT; bear/chop
+    risk held at Test 3's own 0.50% DIP / 0.25% BREAKOUT, unchanged (the
+    prior combo's mistake was raising bear/chop risk above Test 3's level
+    while LOWERING bull risk below it — this run only pushes the bull
+    side further, per the explicit request to widen the spread, not
+    narrow it). Re-runs Test 3's own original config fresh in the same
+    process/data-fetch generation for a true apples-to-apples comparison
+    (yfinance's own historical data can drift slightly session to
+    session — see this feature's earlier regression-check note).
+    MAX_CONCURRENT=6, Mixed 30-symbol universe, FOMC blackout active,
+    circuit breaker disabled, whole-share sizing, full 2022-present
+    window.
+    """
+    symbols = bt.UNIVERSES["Mixed"]
+
+    print(f"Test 3 baseline (re-run fresh for a fair comparison): {START} -> {END} ...",
+         flush=True)
+    test3_res, _ = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=False, max_concurrent=6,
+        regime_filter={"sma_window": 50, "aggressive": (0.0125, 0.0075),
+                      "base": (0.0050, 0.0025)})
+    test3_metrics = compute_metrics(test3_res, capital)
+
+    print(f"Widened spread (1.50%/1.00% bull, 0.50%/0.25% bear/chop): "
+         f"{START} -> {END} ...", flush=True)
+    wide_res, _ = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=False, max_concurrent=6,
+        regime_filter={"sma_window": 50,
+                      "aggressive": (0.0150, 0.0100),   # bull: 1.50% DIP / 1.00% BREAKOUT
+                      "base": (0.0050, 0.0025)})        # bear/chop: 0.50% DIP / 0.25% BREAKOUT
+    wide_metrics = compute_metrics(wide_res, capital)
+
+    goal_hit = wide_metrics["ann_return_pct"] > 20 and wide_metrics["max_dd_pct"] < 15
+    width = 84
+    print("=" * width)
+    print("WIDENED REGIME SPREAD vs TEST 3 BASELINE")
+    print(f"${capital:,.0f} starting capital, Mixed universe (30 symbols), "
+         f"MAX_CONCURRENT=6, {START} -> {END}")
+    print("Test 3:  bull 1.25% DIP/0.75% BREAKOUT | bear/chop 0.50% DIP/0.25% BREAKOUT")
+    print("Widened: bull 1.50% DIP/1.00% BREAKOUT | bear/chop 0.50% DIP/0.25% BREAKOUT")
+    print("=" * width)
+    print(f"{'Metric':<24}{'Test 3 Baseline':>22}{'Widened Spread':>22}")
+    print("-" * width)
+    print(f"{'Total Return':<24}{test3_metrics['total_return_pct']:>+21.2f}%"
+         f"{wide_metrics['total_return_pct']:>+21.2f}%")
+    print(f"{'CAGR (Annualized)':<24}{test3_metrics['ann_return_pct']:>+21.2f}%"
+         f"{wide_metrics['ann_return_pct']:>+21.2f}%")
+    print(f"{'Max Drawdown':<24}{test3_metrics['max_dd_pct']:>21.2f}%"
+         f"{wide_metrics['max_dd_pct']:>21.2f}%")
+    print(f"{'Sharpe Ratio':<24}{test3_metrics['sharpe']:>22.3f}"
+         f"{wide_metrics['sharpe']:>22.3f}")
+    print(f"{'Total Trades':<24}{test3_metrics['n_trades']:>22}{wide_metrics['n_trades']:>22}")
+    print("-" * width)
+    print(f"Goal (CAGR>20% AND MaxDD<15%) — Widened Spread: "
+         f"{'MET' if goal_hit else 'NOT MET'}")
+    print("=" * width)
+    return wide_metrics
+
+
+def run_strategy_a_adx_conviction(capital: float = 1_900.0,
+                                  targets: tuple[float, ...] = (4_000.0, 5_000.0)
+                                  ) -> dict:
+    """
+    Strategy A — ADX-Scaled Conviction Sizing: layers ADX-based conviction
+    tiers on top of the 50-day SMA regime filter's bull-regime risk.
+
+    IMPORTANT STRUCTURAL NOTE, confirmed from this engine's own signal-
+    routing rule (see the candidate-scan phase 3 code): a DIP/MR entry's
+    ADX is ALWAYS < ADX_RANGE_MAX (20) — that IS the ranging-regime
+    eligibility test. A ">35" or ">45" ADX conviction tier is therefore
+    structurally unreachable for DIP trades; conviction tiering only ever
+    applies to BREAKOUT (MOM) trades in practice, which typically already
+    print ADX comfortably above 25 (BREAKOUT eligibility requires ADX
+    above the symbol's own dynamic 80th-percentile threshold, floored at
+    that level). DIP trades in the bull regime always size at the
+    standard 1.25% tier here — never 1.875% or 2.50%, no matter how the
+    request's tiers are written, because they can never qualify.
+
+    Bull regime (SPY > 50-day SMA):
+      Standard  (any BREAKOUT ADX not in a higher tier): 0.75% BREAKOUT / 1.25% DIP
+      High conviction  (BREAKOUT ADX > 35): 1.5x -> 1.125% BREAKOUT (DIP unreachable)
+      Extreme conviction (BREAKOUT ADX > 45): 2.0x -> 1.50% BREAKOUT (DIP unreachable)
+    Bear/chop regime (SPY <= 50-day SMA): flat 0.25% BREAKOUT / 0.50% DIP,
+    regardless of ADX.
+
+    MAX_CONCURRENT=6, Mixed 30-symbol universe, FOMC blackout active,
+    circuit breaker disabled (established daily-bar over-blocking
+    finding), whole-share sizing, full 2022-present window, $capital
+    starting capital. Reports time-to-target for each value in `targets`
+    read directly off the actual simulated equity curve's first crossing
+    (see _time_to_reach()) — not a CAGR extrapolation.
+    """
+    symbols = bt.UNIVERSES["Mixed"]
+    print(f"Strategy A (ADX-scaled conviction sizing): {START} -> {END} ...", flush=True)
+    res, stats = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=False, max_concurrent=6,
+        regime_filter={
+            "sma_window": 50,
+            "aggressive": (0.0125, 0.0075),   # bull standard: 1.25% DIP / 0.75% BREAKOUT
+            "base": (0.0050, 0.0025),         # bear/chop: 0.50% DIP / 0.25% BREAKOUT
+            "conviction_tiers_mom": [(45, 2.0), (35, 1.5)],  # (ADX threshold, multiplier)
+        })
+    metrics = compute_metrics(res, capital)
+    goal_hit = metrics["ann_return_pct"] > 20 and metrics["max_dd_pct"] < 15
+
+    width = 82
+    print("=" * width)
+    print("STRATEGY A — ADX-SCALED CONVICTION SIZING")
+    print(f"${capital:,.0f} starting capital, Mixed universe (30 symbols), "
+         f"MAX_CONCURRENT=6, {START} -> {END}")
+    print("Bull: standard 1.25% DIP/0.75% BRK | ADX>35 -> 1.5x BRK | ADX>45 -> 2.0x BRK")
+    print("      (DIP conviction tiers unreachable — DIP entries always have ADX<20)")
+    print("Bear/Chop: flat 0.50% DIP / 0.25% BREAKOUT")
+    print("=" * width)
+    print(f"{'Total Return':<24}{metrics['total_return_pct']:>+10.2f}%")
+    print(f"{'CAGR (Annualized)':<24}{metrics['ann_return_pct']:>+10.2f}%")
+    print(f"{'Max Drawdown':<24}{metrics['max_dd_pct']:>10.2f}%")
+    print(f"{'Sharpe Ratio':<24}{metrics['sharpe']:>10.3f}")
+    print(f"{'Total Trades':<24}{metrics['n_trades']:>10}")
+    print("-" * width)
+    for target in targets:
+        time_desc, _ = _time_to_reach(res.equity, target)
+        print(f"Time to grow ${capital:,.0f} -> ${target:,.0f}: {time_desc}")
+    print("-" * width)
+    print(f"Goal (CAGR>20% AND MaxDD<15%): {'MET' if goal_hit else 'NOT MET'}")
+    print("=" * width)
+    return metrics
+
+
+def run_strategy_b_scale_out(capital: float = 1_900.0,
+                             targets: tuple[float, ...] = (4_000.0, 5_000.0)
+                             ) -> dict:
+    """
+    Strategy B — Multi-Stage Scale-Out Execution: Test 3's regime
+    parameters (1.25% DIP / 0.75% BREAKOUT bull, 0.50% DIP / 0.25%
+    BREAKOUT bear/chop — no ADX conviction tiering this time, per the
+    request), with BREAKOUT's exit mechanic replaced by a two-tranche
+    scale-out (breakout_scale_out): tranche 1 (50% of the position) exits
+    at a FIXED entry_px + 1.5x ATR-at-entry level, moving the remainder's
+    stop to breakeven; tranche 2 (the remaining 50%) trails with a wide
+    3.5x ATR stop from there until stopped out. DIP trades are entirely
+    unaffected — this mechanic only touches MOM/BREAKOUT exits.
+
+    MAX_CONCURRENT=6, Mixed 30-symbol universe, FOMC blackout active,
+    circuit breaker disabled (established daily-bar over-blocking
+    finding), whole-share sizing, full 2022-present window, $capital
+    starting capital. Reports time-to-target for each value in `targets`
+    off the actual simulated equity curve (see _time_to_reach()).
+    """
+    symbols = bt.UNIVERSES["Mixed"]
+    print(f"Strategy B (multi-stage scale-out): {START} -> {END} ...", flush=True)
+    res, stats = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=False, max_concurrent=6,
+        regime_filter={"sma_window": 50,
+                      "aggressive": (0.0125, 0.0075),   # bull: 1.25% DIP / 0.75% BREAKOUT
+                      "base": (0.0050, 0.0025)},         # bear/chop: 0.50% DIP / 0.25% BREAKOUT
+        breakout_scale_out={"tranche_atr_mult": 1.5, "trail_atr_mult_after_scale": 3.5})
+    metrics = compute_metrics(res, capital)
+    goal_hit = metrics["ann_return_pct"] > 20 and metrics["max_dd_pct"] < 15
+
+    mom_trades = [t for t in res.trades if t.style == "MOM"]
+    scaled_out = sum(1 for t in mom_trades if t.scaled)
+
+    width = 82
+    print("=" * width)
+    print("STRATEGY B — MULTI-STAGE SCALE-OUT EXECUTION")
+    print(f"${capital:,.0f} starting capital, Mixed universe (30 symbols), "
+         f"MAX_CONCURRENT=6, {START} -> {END}")
+    print("Regime: bull 1.25% DIP/0.75% BRK | bear/chop 0.50% DIP/0.25% BRK "
+         "(Test 3 parameters, no ADX conviction tiers)")
+    print("BREAKOUT exits: Tranche 1 (50%) @ +1.5x ATR-at-entry -> breakeven stop "
+         "| Tranche 2 (50%) trails @ 3.5x ATR")
+    print("=" * width)
+    print(f"{'Total Return':<24}{metrics['total_return_pct']:>+10.2f}%")
+    print(f"{'CAGR (Annualized)':<24}{metrics['ann_return_pct']:>+10.2f}%")
+    print(f"{'Max Drawdown':<24}{metrics['max_dd_pct']:>10.2f}%")
+    print(f"{'Sharpe Ratio':<24}{metrics['sharpe']:>10.3f}")
+    print(f"{'Total Trades':<24}{metrics['n_trades']:>10}")
+    print(f"{'BREAKOUT trades':<24}{len(mom_trades):>10}")
+    print(f"{'  -> reached Tranche 1':<24}{scaled_out:>10}")
+    print("-" * width)
+    for target in targets:
+        time_desc, _ = _time_to_reach(res.equity, target)
+        print(f"Time to grow ${capital:,.0f} -> ${target:,.0f}: {time_desc}")
+    print("-" * width)
+    print(f"Goal (CAGR>20% AND MaxDD<15%): {'MET' if goal_hit else 'NOT MET'}")
+    print("=" * width)
+    return metrics
+
+
+def run_strategy_c_leveraged_overlay(capital: float = 1_900.0,
+                                     targets: tuple[float, ...] = (4_000.0, 5_000.0)
+                                     ) -> dict:
+    """
+    Strategy C — Leveraged Benchmark Overlay: the Mixed 30-symbol universe
+    plus QLD (2x Nasdaq) and SSO (2x S&P 500), under the Widened Regime
+    Filter (bull: 1.50% DIP / 1.00% BREAKOUT; bear/chop: 0.50% DIP / 0.25%
+    BREAKOUT — same as run_widened_regime_spread()'s "Widened Spread" row),
+    with QLD/SSO's BREAKOUT signals additionally confined to bull-regime
+    days only via breakout_gate_symbols — their DIP signals are
+    unrestricted, same as any other symbol. Verified (not assumed): both
+    tickers have full daily history back well before 2022.
+
+    MAX_CONCURRENT=6, FOMC blackout active, circuit breaker disabled
+    (established daily-bar over-blocking finding), whole-share sizing,
+    full 2022-present window, $capital starting capital. Reports
+    time-to-target for each value in `targets` off the actual simulated
+    equity curve (see _time_to_reach()).
+    """
+    symbols = bt.UNIVERSES["Mixed"] + ["QLD", "SSO"]
+    print(f"Strategy C (leveraged benchmark overlay, {len(symbols)} symbols): "
+         f"{START} -> {END} ...", flush=True)
+    res, stats = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=False, max_concurrent=6,
+        regime_filter={"sma_window": 50,
+                      "aggressive": (0.0150, 0.0100),   # bull: 1.50% DIP / 1.00% BREAKOUT
+                      "base": (0.0050, 0.0025)},         # bear/chop: 0.50% DIP / 0.25% BREAKOUT
+        breakout_gate_symbols={"QLD", "SSO"})
+    metrics = compute_metrics(res, capital)
+    goal_hit = metrics["ann_return_pct"] > 20 and metrics["max_dd_pct"] < 15
+
+    lev_trades = [t for t in res.trades if t.symbol in ("QLD", "SSO")]
+    lev_mom = sum(1 for t in lev_trades if t.style == "MOM")
+    lev_mr = sum(1 for t in lev_trades if t.style == "MR")
+
+    width = 82
+    print("=" * width)
+    print("STRATEGY C — LEVERAGED BENCHMARK OVERLAY")
+    print(f"${capital:,.0f} starting capital, {len(symbols)}-symbol universe "
+         f"(Mixed 30 + QLD + SSO), MAX_CONCURRENT=6, {START} -> {END}")
+    print("Widened regime: bull 1.50% DIP/1.00% BRK | bear/chop 0.50% DIP/0.25% BRK")
+    print("QLD/SSO: BREAKOUT signals gated to bull-regime days only; DIP unrestricted")
+    print("=" * width)
+    print(f"{'Total Return':<24}{metrics['total_return_pct']:>+10.2f}%")
+    print(f"{'CAGR (Annualized)':<24}{metrics['ann_return_pct']:>+10.2f}%")
+    print(f"{'Max Drawdown':<24}{metrics['max_dd_pct']:>10.2f}%")
+    print(f"{'Sharpe Ratio':<24}{metrics['sharpe']:>10.3f}")
+    print(f"{'Total Trades':<24}{metrics['n_trades']:>10}")
+    print(f"{'  QLD/SSO trades':<24}{len(lev_trades):>10}  ({lev_mr} DIP, {lev_mom} BREAKOUT)")
+    print("-" * width)
+    for target in targets:
+        time_desc, _ = _time_to_reach(res.equity, target)
+        print(f"Time to grow ${capital:,.0f} -> ${target:,.0f}: {time_desc}")
+    print("-" * width)
+    print(f"Goal (CAGR>20% AND MaxDD<15%): {'MET' if goal_hit else 'NOT MET'}")
+    print("=" * width)
+    return metrics
+
+
+EXTREME_SPRINT_UNIVERSE: list[str] = [
+    "NVDA", "AMD", "TSLA", "PLTR", "SMCI", "AVGO", "META", "AMZN", "TQQQ", "SOXL",
+]
+
+
+def run_extreme_sprint_test(capital: float = 1_900.0, target: float = 4_000.0
+                            ) -> dict:
+    """
+    Aggressive Sprint Phase test: a 10-symbol high-volatility TMT-momentum
+    + 3x-leverage universe (verified — not assumed — to all have current,
+    continuous daily data), regime-gated UNCONSTRAINED risk sizing (bull:
+    3.00% DIP / 2.00% BREAKOUT; bear: 0.50% DIP / 0.50% BREAKOUT — both far
+    beyond anything else tested in this file), and BREAKOUT pyramiding
+    (pyramid_config: +1.0x ATR trigger, 50% add, breakeven stop on the
+    original tranche — see that parameter's MODELING SIMPLIFICATION note
+    on the single-stop/blended-cost-basis approximation this uses).
+    MAX_CONCURRENT=6, fractional-share sizing, FOMC blackout active,
+    circuit breaker disabled (established daily-bar over-blocking
+    finding), full 2022-present window, $capital starting capital.
+
+    Reports whether/when the equity curve first closes at or above
+    `target`, read off the actual simulated path (see _time_to_reach()) —
+    against the requested "1.5 years" reference point, not as a target
+    this function enforces or guarantees.
+    """
+    symbols = EXTREME_SPRINT_UNIVERSE
+    print(f"Extreme Sprint Phase test ({len(symbols)}-symbol high-vol/leverage "
+         f"universe): {START} -> {END} ...", flush=True)
+    res, stats = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=True, max_concurrent=6,
+        regime_filter={"sma_window": 50,
+                      "aggressive": (0.0300, 0.0200),   # bull: 3.00% DIP / 2.00% BREAKOUT
+                      "base": (0.0050, 0.0050)},         # bear: 0.50% DIP / 0.50% BREAKOUT
+        pyramid_config={"trigger_atr_mult": 1.0, "add_fraction": 0.5})
+    metrics = compute_metrics(res, capital)
+
+    mom_trades = [t for t in res.trades if t.style == "MOM"]
+    pyramided = sum(1 for t in mom_trades if t.scaled)
+    time_desc, hit_date = _time_to_reach(res.equity, target)
+
+    width = 84
+    print("=" * width)
+    print("EXTREME SPRINT PHASE — 10-SYMBOL HIGH-VOLATILITY/LEVERAGE UNIVERSE")
+    print(f"${capital:,.0f} starting capital, {len(symbols)} symbols "
+         f"({', '.join(symbols)}), MAX_CONCURRENT=6, fractional sizing, "
+         f"{START} -> {END}")
+    print("Bull: 3.00% DIP / 2.00% BREAKOUT   Bear: 0.50% DIP / 0.50% BREAKOUT")
+    print("BREAKOUT pyramiding: +1.0x ATR trigger, +50% size, breakeven stop on tranche 1")
+    print("=" * width)
+    print(f"{'Total Return':<24}{metrics['total_return_pct']:>+10.2f}%")
+    print(f"{'CAGR (Annualized)':<24}{metrics['ann_return_pct']:>+10.2f}%")
+    print(f"{'Max Drawdown':<24}{metrics['max_dd_pct']:>10.2f}%")
+    print(f"{'Sharpe Ratio':<24}{metrics['sharpe']:>10.3f}")
+    print(f"{'Total Trades':<24}{metrics['n_trades']:>10}")
+    print(f"{'  BREAKOUT trades':<24}{len(mom_trades):>10}  ({pyramided} pyramided)")
+    print("-" * width)
+    print(f"Time to grow ${capital:,.0f} -> ${target:,.0f}: {time_desc}")
+    print("=" * width)
+    return metrics
+
+
+def run_margin_leverage_test(capital: float = 1_900.0, target: float = 4_000.0,
+                             margin_multiplier: float = 1.5) -> dict:
+    """
+    Aggressive Margin/Leverage test: pure position-scaling, isolating
+    buying-power leverage from the universe/pyramiding confounds of the
+    prior Extreme Sprint test — back to the standard 30-symbol Mixed
+    universe (which the prior test's diagnosis showed matters: signal
+    scarcity, not risk-per-trade size, was the real bottleneck on a
+    narrow 10-symbol book). Unconstrained regime risk (bull: 3.50% DIP /
+    2.00% BREAKOUT; bear: 0.50% DIP / 0.25% BREAKOUT), MAX_CONCURRENT=8,
+    and `margin_multiplier`=1.5 (buying power = 1.5x equity, i.e. $2,850
+    on $1,900 — see that parameter's docstring on run_risk_managed_backtest
+    for exactly what it does and does NOT model, notably: no financing
+    cost on the borrowed balance).
+
+    Whole-share sizing (not fractional — not requested this time), FOMC
+    blackout active, circuit breaker disabled (established daily-bar
+    over-blocking finding), full 2022-present window, $capital starting
+    capital. Reports whether/when the equity curve first closes at or
+    above `target`, off the actual simulated path (see _time_to_reach()).
+    """
+    symbols = bt.UNIVERSES["Mixed"]
+    print(f"Margin/Leverage test ({margin_multiplier}x buying power): "
+         f"{START} -> {END} ...", flush=True)
+    res, stats = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=False, max_concurrent=8,
+        regime_filter={"sma_window": 50,
+                      "aggressive": (0.0350, 0.0200),   # bull: 3.50% DIP / 2.00% BREAKOUT
+                      "base": (0.0050, 0.0025)},         # bear: 0.50% DIP / 0.25% BREAKOUT
+        margin_multiplier=margin_multiplier)
+    metrics = compute_metrics(res, capital)
+    time_desc, _ = _time_to_reach(res.equity, target)
+
+    width = 82
+    print("=" * width)
+    print("MARGIN/LEVERAGE TEST — PURE POSITION SCALING")
+    print(f"${capital:,.0f} starting capital ({margin_multiplier}x buying power = "
+         f"${capital * margin_multiplier:,.0f}), Mixed universe (30 symbols), "
+         f"MAX_CONCURRENT=8, {START} -> {END}")
+    print("Bull: 3.50% DIP / 2.00% BREAKOUT   Bear: 0.50% DIP / 0.25% BREAKOUT")
+    print("=" * width)
+    print(f"{'Total Return':<24}{metrics['total_return_pct']:>+10.2f}%")
+    print(f"{'CAGR (Annualized)':<24}{metrics['ann_return_pct']:>+10.2f}%")
+    print(f"{'Max Drawdown':<24}{metrics['max_dd_pct']:>10.2f}%")
+    print(f"{'Sharpe Ratio':<24}{metrics['sharpe']:>10.3f}")
+    print(f"{'Total Trades':<24}{metrics['n_trades']:>10}")
+    print(f"{'Avg Open Positions':<24}{stats.avg_open_positions:>10.2f}  (of {stats.max_concurrent_used} cap)")
+    print("-" * width)
+    print(f"Time to grow ${capital:,.0f} -> ${target:,.0f}: {time_desc}")
+    print("=" * width)
+    return metrics
+
+
+def run_sp500_universe_test(capital: float = 1_900.0, target: float = 4_000.0
+                            ) -> dict:
+    """
+    Dynamic universe screener test: the current S&P 500 constituents
+    (data.sp500_symbols(), ~503 tickers as of the run date — includes a
+    few dual-class-share companies, hence >500) as the tradeable universe,
+    under the Widened Spread regime filter (bull: 1.50% DIP / 1.00%
+    BREAKOUT; bear: 0.50% DIP / 0.25% BREAKOUT — same as
+    run_widened_regime_spread()), MAX_CONCURRENT=6, fractional-share
+    sizing. FOMC blackout active, circuit breaker disabled (established
+    daily-bar over-blocking finding), full 2022-present window, $capital
+    starting capital.
+
+    SURVIVORSHIP CAVEAT, disclosed rather than silently assumed: this is
+    TODAY's S&P 500 membership run backward over 2022-present — any
+    company added to the index after 2022 is included for its full listed
+    history (fine), but any company REMOVED from the index since 2022 is
+    absent for the whole window, even for the period it genuinely was a
+    constituent. This is the same "hindsight-chosen universe" caveat this
+    project's own prior research (the old fundamental-screener line of
+    work) already flagged for a dynamic index-membership universe.
+
+    Reports whether/when the equity curve first closes at or above
+    `target`, off the actual simulated path (see _time_to_reach()).
+    """
+    symbols = data.sp500_symbols()
+    print(f"S&P 500 universe test ({len(symbols)} nominal symbols — some may "
+         f"lack sufficient 2022-present history and get skipped, see below): "
+         f"{START} -> {END} ...", flush=True)
+    res, stats = run_risk_managed_backtest(
+        symbols, START, END, capital, use_circuit_breaker=False,
+        fractional_shares=True, max_concurrent=6,
+        regime_filter={"sma_window": 50,
+                      "aggressive": (0.0150, 0.0100),   # bull: 1.50% DIP / 1.00% BREAKOUT
+                      "base": (0.0050, 0.0025)})         # bear: 0.50% DIP / 0.25% BREAKOUT
+    metrics = compute_metrics(res, capital)
+    time_desc, _ = _time_to_reach(res.equity, target)
+
+    width = 82
+    print("=" * width)
+    print("S&P 500 DYNAMIC UNIVERSE TEST — SOLVING SIGNAL SCARCITY HORIZONTALLY")
+    print(f"${capital:,.0f} starting capital, {len(symbols)} nominal symbols "
+         f"(S&P 500), MAX_CONCURRENT=6, fractional sizing, {START} -> {END}")
+    print("Widened regime: bull 1.50% DIP/1.00% BRK | bear 0.50% DIP/0.25% BRK")
+    print("=" * width)
+    print(f"{'Total Return':<24}{metrics['total_return_pct']:>+10.2f}%")
+    print(f"{'CAGR (Annualized)':<24}{metrics['ann_return_pct']:>+10.2f}%")
+    print(f"{'Max Drawdown':<24}{metrics['max_dd_pct']:>10.2f}%")
+    print(f"{'Sharpe Ratio':<24}{metrics['sharpe']:>10.3f}")
+    print(f"{'Total Trades':<24}{metrics['n_trades']:>10}")
+    print(f"{'Avg Open Positions':<24}{stats.avg_open_positions:>10.2f}  (of {stats.max_concurrent_used} cap)")
+    print("-" * width)
+    print(f"Time to grow ${capital:,.0f} -> ${target:,.0f}: {time_desc}")
+    print("=" * width)
+    return metrics
 
 
 def main_daily() -> int:

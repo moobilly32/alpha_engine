@@ -38,9 +38,17 @@ MAX_POSITION_PCT = 0.30   # hard cap: one name may not exceed 30% of equity
 # Raised from 2 for swing. Holding multi-day means slots stay occupied for days
 # rather than hours, so a cap of 2 would block most signals and let arrival
 # order, not quality, pick the book. 4 active position slots (locked config).
+# Owned by execution_engine.py/intraday.py (the older, currently-dormant
+# engine) ONLY — hybrid_engine.py has its OWN HYBRID_MAX_CONCURRENT below,
+# deliberately not sharing this constant, per the isolation rule the two
+# engines have kept since hybrid_engine.py was first built.
 MAX_CONCURRENT = 4
 MIN_POSITION_USD = 5.00   # below this the trade is not worth the friction
 ALLOW_FRACTIONAL = True   # Robinhood supports fractional shares
+
+# hybrid_engine.py's own concurrency cap — the Widened Spread Regime Filter
+# deployment (see hybrid_indicators.py's REGIME_* constants).
+HYBRID_MAX_CONCURRENT = 6
 
 # ---------------------------------------------------------------- mode
 # SWING: positions are held across sessions until the stop or the target is hit.

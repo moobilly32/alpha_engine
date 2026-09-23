@@ -16,16 +16,25 @@ Two fully independent connections to the same paper account is fine:
 alpaca-py authenticates per-instance over HTTP with no shared local session,
 so this and execution_engine.py's own connection never collide.
 
-PRODUCTION RISK MANAGEMENT (merged in after hypothetical_backtester.py's
-validated 4-year stress test — +65.15% total return vs. baseline's +56.38%,
-essentially unchanged max drawdown, isolating the FOMC blackout's effect
-with sizing held identical to baseline):
-  1. Dynamic ATR/stop-distance position sizing, asymmetric risk — already
-     implemented in hybrid_indicators.size_order(): DIP risks 0.625% of live
-     equity off a fixed 2.5% stop, BREAKOUT risks 0.25% off a 2.0x ATR14
-     stop. Recomputed every cycle from broker.get_equity() (never a fixed
-     capital figure) and the live ATR-based stop distance. Sized as a
-     PRECISE FRACTIONAL share quantity (no whole-share floor), which is why
+PRODUCTION RISK MANAGEMENT — WIDENED SPREAD REGIME FILTER (permanent config,
+deployed after hypothetical_backtester.py's regime-filter research this
+session; best isolated backtest: ~+115% total return / ~9.8% max drawdown /
+Sharpe ~1.2 over 2022-present, $100k. DISCLOSED CAVEAT: unlike the ORIGINAL
+0.625%/0.25% baseline this replaced — which went through a live dry-run and
+fill-verification pass before being cleared for forward paper testing —
+this config's validation is backtest-only; it has not been through that
+same live-testing cycle at these risk levels):
+  1. Dynamic ATR/stop-distance position sizing, regime-gated asymmetric
+     risk — implemented in hybrid_indicators.size_order() /
+     current_spy_regime(): whenever SPY's last completed daily close is
+     above its own rolling 50-day SMA ("BULL"), DIP risks 1.50% of live
+     equity off a fixed 2.5% stop and BREAKOUT risks 1.00% off a 2.0x
+     ATR14 stop; otherwise ("BEAR"), DIP risks 0.50% and BREAKOUT risks
+     0.25% — the SAME asymmetric DIP-heavier-than-BREAKOUT shape as
+     before, just doubled in the bull regime. Recomputed every cycle from
+     broker.get_equity() (never a fixed capital figure), the live regime
+     read, and the live ATR-based stop distance. Sized as a PRECISE
+     FRACTIONAL share quantity (no whole-share floor), which is why
      execute_signals() submits entries via Broker.buy_market() rather than
      buy_limit() — neither Alpaca nor Robinhood accepts a fractional
      quantity on a limit order, only on market/notional orders. There is
@@ -46,7 +55,11 @@ with sizing held identical to baseline):
      It is fully enabled here, on this file's own live 5-minute SPY data,
      since this IS the intraday engine the rule was designed for and no
      daily-bar proxy is needed.
-Both gates block ONLY new entries (--execute / --dry-run, via
+  4. HYBRID_MAX_CONCURRENT (config.py, currently 6) caps simultaneously
+     OPEN/PENDING positions — enforced in execute_signals(), a live gap
+     that did not exist before this deployment (the book had no
+     concurrency cap at all until now).
+Both gates (2/3) block ONLY new entries (--execute / --dry-run, via
 check_entry_gates()) — an already-OPEN position keeps managing off its own
 stop/target/trailing-stop in --manage regardless of either gate.
 
@@ -71,10 +84,11 @@ from dotenv import load_dotenv
 
 import data
 from calendar_util import now_ny
-from config import BASE, DATA as DATA_DIR
+from config import BASE, DATA as DATA_DIR, HYBRID_MAX_CONCURRENT
 from hybrid_indicators import (
-    MIXED_UNIVERSE, STOP_ATR_MULT, STOP_PCT, TARGET_R, current_atr, size_order,
-    snapshot_universe,
+    MIXED_UNIVERSE, RISK_PCT_BREAKOUT_BEAR, RISK_PCT_BREAKOUT_BULL,
+    RISK_PCT_DIP_BEAR, RISK_PCT_DIP_BULL, STOP_ATR_MULT, STOP_PCT, TARGET_R,
+    current_atr, size_order, snapshot_universe,
 )
 
 load_dotenv(BASE / ".env")
@@ -538,10 +552,17 @@ def execute_signals() -> None:
         return
 
     positions = _load_positions()
+    active_count = sum(1 for p in positions.values()
+                       if p.get("status") in ("OPEN", "PENDING"))
+
     for s in snaps:
         if s.symbol in positions:
             print(f"{s.symbol}: already tracked in hybrid_positions.json "
                  f"(status={positions[s.symbol].get('status')}) — skipping")
+            continue
+        if active_count >= HYBRID_MAX_CONCURRENT:
+            print(f"{s.symbol}: {s.mode} signal active but book is full "
+                 f"({active_count}/{HYBRID_MAX_CONCURRENT} OPEN/PENDING) — skipping")
             continue
         order = size_order(s, equity)
         if order is None:
@@ -560,6 +581,7 @@ def execute_signals() -> None:
         record = _build_position_record(order, order_id, broker_order, broker_mode)
         positions[order.symbol] = record
         _save_positions(positions)
+        active_count += 1   # this cycle's new OPEN/PENDING entry now occupies a slot too
 
         if record["status"] == "OPEN":
             print(f"{s.symbol}: FILLED -> OPEN ({record['shares']} sh @ "
@@ -934,6 +956,11 @@ def main() -> int:
                          "list_positions() directly, not local state; "
                          "read-only, flags any local/broker mismatch)")
     args = ap.parse_args()
+
+    print(f"[SYSTEM ACTIVE] Widened Spread Engine | Bull "
+         f"({RISK_PCT_BREAKOUT_BULL*100:.2f}%/{RISK_PCT_DIP_BULL*100:.2f}%) "
+         f"Bear ({RISK_PCT_BREAKOUT_BEAR*100:.2f}%/{RISK_PCT_DIP_BEAR*100:.2f}%) "
+         f"| Max Concurrency: {HYBRID_MAX_CONCURRENT}")
 
     if args.screen:
         print_screen()
