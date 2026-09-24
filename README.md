@@ -24,48 +24,64 @@ a broker-agnostic interface, fully automated through macOS `launchd`.
 
 ---
 
-## Backtested Performance (2022–Present, $1,900 Starting Capital)
+## Backtested Performance (2022–Present) — Widened Spread Engine
 
-Full 4-year daily-bar simulation (`hypothetical_backtester.py`), production risk
-config, fractional-share sizing, 30-symbol Mixed universe, `MAX_CONCURRENT=4`.
+Full 4-year daily-bar simulation (`hypothetical_backtester.py`,
+`run_widened_regime_spread()`) of the SPY 50-day SMA regime filter now deployed
+as the permanent production config (see *Dynamic Regime Risk Sizing* below).
+Run conditions: $100,000 starting capital, whole-share sizing, 30-symbol Mixed
+universe.
 
 | Metric | Value |
 |---|---|
-| Total Return | **+65.24%** |
-| Final Account Value | **$3,139.60** |
-| Win Rate | 52.4% |
-| Max Drawdown | 8.55% |
-| Sharpe Ratio | 1.156 |
-| Executed Trades | 357 |
-| Skipped Trades (0-share) | **0**, via fractional market entries |
+| Total Return | **+115.66%** |
+| CAGR (Annualized) | **+17.66%** |
+| Max Drawdown | 9.83% |
+| Sharpe Ratio | 1.214 |
+| Total Trades | 296 |
+| Concurrency | `MAX_CONCURRENT = 6` |
 
-For comparison, the same window/config with the OLD whole-share `floor()` sizing
-skipped **91 signals** entirely (couldn't afford 1 whole share at the target risk)
-and returned +58.64% / $3,014.14 final value — fractional sizing is what makes a
-$1,900 account viable for this strategy at all. See *Known Limitations* for the one
-execution-mechanics caveat this comparison doesn't capture (backtest fills are
-frictionless; live market orders carry real slippage).
+This is a **backtest**, not a live result — see *Production Status* above. Unlike
+the ORIGINAL 0.625% DIP / 0.25% BREAKOUT baseline this configuration replaced
+— which went through a live dry-run and fill-verification pass before being
+cleared for forward paper testing — this regime-filter config's validation is
+backtest-only; it has not yet been through that same live-testing cycle at
+these (roughly doubled) risk levels. See *Known Limitations*.
 
-This is a **backtest**, not a live result — see *Production Status* above.
+**For reference, not as the current number**: the original baseline's own
+backtest (0.625% DIP / 0.25% BREAKOUT, fractional sizing, $1,900 starting
+capital, `MAX_CONCURRENT=4`) returned +65.24% total return / $3,139.60 final
+value over the same window, with 0 skipped trades thanks to fractional sizing
+(vs. 91 skipped signals under the old whole-share `floor()` sizing, which this
+project also measured on that same run).
 
 ---
 
 ## Key Engineering Modules
 
-### Asymmetric Risk Parameters
+### Dynamic Regime Risk Sizing
 `hybrid_indicators.py` sizes every entry as `shares = risk_dollars / (entry − stop)`,
-with the risk target split by signal type:
+but `risk_dollars`' percentage is no longer a flat constant — `current_spy_regime()`
+selects it live, per signal, from whether SPY's last COMPLETED daily close sits
+above or below its own rolling 50-day SMA (the **Widened Spread Regime Filter**,
+the permanent production config since this engine's v1.1 deployment):
 
-- **DIP** (mean-reversion): **0.625%** of equity, off a fixed 2.5% stop, with a
-  2.5R profit target.
-- **BREAKOUT** (momentum): **0.25%** of equity, off a 2.0× ATR(14) stop that
-  trails up (never down) — no fixed target; exits purely via the trailing stop.
+- **Bull regime** (SPY > 50-day SMA): **1.50%** DIP / **1.00%** BREAKOUT.
+- **Bear regime** (SPY ≤ 50-day SMA): **0.50%** DIP / **0.25%** BREAKOUT.
 
-Regime routing: ADX(14) < 20 → DIP-eligible (ranging); ADX above the symbol's own
-rolling 50-session 80th-percentile threshold (floored at 25) → BREAKOUT-eligible
-(trending). The asymmetry is deliberate — a DIP is a confirmed oversold setup with
-a validated historical edge; a BREAKOUT is taken the moment it prints, with no
-confirmation yet that the move continues, so it gets a much smaller risk budget.
+DIP risks off a fixed 2.5% stop with a 2.5R profit target; BREAKOUT risks off a
+2.0× ATR(14) stop that trails up (never down) — no fixed target, exits purely via
+the trailing stop. The DIP-heavier-than-BREAKOUT shape is unchanged from the
+original design (a DIP is a confirmed oversold setup with a validated historical
+edge; a BREAKOUT is taken the moment it prints, with no confirmation yet that the
+move continues) — the regime filter scales both up together in a bull market and
+back down together otherwise, roughly doubling every risk figure in a bull regime
+versus the original flat 0.625%/0.25% baseline.
+
+Signal classification itself (DIP vs. BREAKOUT eligibility) is a separate, ADX-based
+regime read, unaffected by the SPY sizing filter above: ADX(14) < 20 → DIP-eligible
+(ranging); ADX above the symbol's own rolling 50-session 80th-percentile threshold
+(floored at 25) → BREAKOUT-eligible (trending).
 
 ### Fractional Execution Engine
 Precision floating-point order sizing (`round(shares, 6)`) with **no whole-share
@@ -187,6 +203,12 @@ python3 hybrid_engine.py --status     # verify broker connection + current book
 
 ## Known Limitations
 
+- **Widened Spread Regime Filter validation gap**: this config was deployed to
+  production directly from backtest research — it has not been through the live
+  dry-run and fill-verification pass the ORIGINAL 0.625%/0.25% baseline went
+  through before that one was cleared for forward paper testing. Roughly double
+  the risk-per-trade of the validated baseline, running live on backtest
+  evidence alone.
 - **Backtest vs. live**: the performance table above is a historical simulation.
   It assumes frictionless fills at the strategy's computed price; live market
   orders (required for fractional sizing) will fill at whatever price the market
