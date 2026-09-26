@@ -63,6 +63,23 @@ Both gates (2/3) block ONLY new entries (--execute / --dry-run, via
 check_entry_gates()) — an already-OPEN position keeps managing off its own
 stop/target/trailing-stop in --manage regardless of either gate.
 
+MICRO-LIVE / MULTI-BROKER READINESS (added for a small-size Robinhood
+slippage-testing phase — BROKER_MODE stays alpaca_paper until deliberately
+switched in .env; nothing here changes that on its own):
+  - Fill verification (_poll_order_fill, reconcile_local_state,
+    reconcile_pending_entries) now calls Broker.get_order_status()
+    (broker-agnostic) instead of reaching into b._trading.get_order_by_id()
+    (an Alpaca TradingClient attribute RobinhoodBroker does not have).
+    Under the old code, every PENDING order would have silently stayed
+    PENDING forever under BROKER_MODE=robinhood_live — a real bug caught
+    and fixed as part of this readiness work, not hypothetical.
+  - _log_slippage(): every confirmed fill (whether immediate in
+    execute_signals() or a later promotion in reconcile_pending_entries())
+    logs (fill_price - intended_signal_price) / intended_signal_price as a
+    percentage, to stdout and to slippage_log.csv — broker-agnostic by
+    construction, since it only needs order.entry_price (the pre-trade
+    HybridOrder) and the confirmed fill price both brokers already expose.
+
 Usage:
     python3 hybrid_engine.py --screen      # Step 1: read-only DIP/BREAKOUT scan
     python3 hybrid_engine.py --dry-run     # Step 2: size + print orders, no broker order calls
@@ -73,6 +90,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import json
 import os
@@ -95,6 +113,10 @@ load_dotenv(BASE / ".env")
 
 HYBRID_POSITIONS_FILE = DATA_DIR / "hybrid_positions.json"
 HYBRID_CLOSED_LOG = DATA_DIR / "hybrid_closed_positions.jsonl"
+SLIPPAGE_LOG_FILE = BASE / "slippage_log.csv"
+SLIPPAGE_LOG_HEADER = ["timestamp", "symbol", "trade_type", "intended_price",
+                      "fill_price", "slippage_pct", "shares", "order_id",
+                      "broker_mode"]
 
 
 # ---------------------------------------------------------------- risk gates
@@ -252,6 +274,49 @@ def _save_positions(state: dict) -> None:
         raise
 
 
+# ---------------------------------------------------------------- slippage logging
+def _log_slippage(symbol: str, trade_type: str, intended_price: float,
+                  fill_price: float, shares: float, order_id: str,
+                  broker_mode: str) -> None:
+    """
+    Broker-agnostic execution-quality metric — works identically whether
+    BROKER_MODE is alpaca_paper or robinhood_live, since both already
+    return a real fill price via Broker.get_order_status()/buy_market().
+    `intended_price` is the signal snapshot price size_order() sized off
+    of (HybridOrder.entry_price — see that dataclass), NOT the fill price;
+    `fill_price` is the ACTUAL confirmed fill. Positive slippage_pct means
+    a worse fill for a buy (paid more than the signal price); negative
+    means better (paid less).
+
+    Logged to stdout and appended to SLIPPAGE_LOG_FILE (data/slippage_log.csv,
+    header written once on first-ever entry). Never raises — a logging
+    failure must not take down the live entry path that called this.
+    """
+    try:
+        slippage_pct = (fill_price - intended_price) / intended_price * 100.0
+    except ZeroDivisionError:
+        slippage_pct = float("nan")
+
+    print(f"{symbol}: SLIPPAGE {slippage_pct:+.4f}% (intended {intended_price:.4f}, "
+         f"filled {fill_price:.4f}, {shares} sh, {broker_mode})")
+
+    try:
+        is_new = not SLIPPAGE_LOG_FILE.exists()
+        SLIPPAGE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SLIPPAGE_LOG_FILE, "a", newline="") as fh:
+            writer = csv.writer(fh)
+            if is_new:
+                writer.writerow(SLIPPAGE_LOG_HEADER)
+            writer.writerow([
+                now_ny().isoformat(timespec="seconds"), symbol, trade_type,
+                round(intended_price, 4), round(fill_price, 4),
+                round(slippage_pct, 4), shares, order_id, broker_mode,
+            ])
+    except OSError as e:                                              # noqa: BLE001
+        print(f"{symbol}: slippage log write failed ({type(e).__name__}: {e}) "
+             f"— continuing")
+
+
 # ---------------------------------------------------------------- Step 1: screen
 def print_screen() -> None:
     """
@@ -385,13 +450,18 @@ def print_dry_run() -> None:
 # terminal non-fill state (rejected immediately, etc.) writes nothing at
 # all, since there's nothing to track.
 #
-# Uses order.status.value (plain strings, e.g. "filled", "expired") rather
-# than importing alpaca.trading.enums.OrderStatus at module level, so this
-# file keeps its existing pattern of only loading a broker SDK lazily
-# inside make_broker() — a Robinhood-only setup still never needs
-# alpaca-py installed just to import this module.
+# Uses Broker.get_order_status()'s normalized status vocabulary (see
+# broker_interface.py) rather than reaching into either SDK's raw order
+# object directly — this is what makes fill verification actually work
+# under BROKER_MODE=robinhood_live too, not just alpaca_paper. An earlier
+# version of this code called b._trading.get_order_by_id(...) directly,
+# which is an Alpaca TradingClient attribute RobinhoodBroker does not
+# have — every PENDING order would have silently stayed PENDING forever
+# under Robinhood (the AttributeError was caught by a broad except and
+# treated as "lookup failed, retry next cycle", which never actually
+# retries successfully since the attribute is permanently absent).
 _TERMINAL_UNFILLED_STATUS_VALUES = {
-    "canceled", "expired", "rejected", "done_for_day", "stopped", "suspended",
+    "canceled", "rejected",
 }
 FILL_POLL_ATTEMPTS = 3
 FILL_POLL_INTERVAL_SEC = 1.5
@@ -402,23 +472,22 @@ def _poll_order_fill(b, order_id: str, attempts: int = FILL_POLL_ATTEMPTS,
     """
     Briefly polls a just-submitted order to catch a fast fill (common for a
     limit order placed at/through the current price) before falling back to
-    PENDING. Returns the last Order object seen (or None if every lookup
+    PENDING. Returns the last OrderStatusInfo seen (or None if every lookup
     attempt raised) — NOT a guarantee of a terminal state; a still-working
     order after this window is legitimately PENDING, not an error.
-    Alpaca-specific (b._trading.get_order_by_id), matching the same
-    already-accepted scope limit as reconcile_local_state() below.
+    Broker-agnostic (Broker.get_order_status()) — works under both
+    alpaca_paper and robinhood_live.
     """
     order = None
     for attempt in range(1, attempts + 1):
         try:
-            order = b._trading.get_order_by_id(order_id)
+            order = b.get_order_status(order_id)
         except Exception as e:                                      # noqa: BLE001
             print(f"  fill-check {attempt}/{attempts} failed "
                  f"({type(e).__name__}: {e})")
             order = None
         else:
-            filled_qty = float(order.filled_qty or 0)
-            if filled_qty > 0 or order.status.value in _TERMINAL_UNFILLED_STATUS_VALUES:
+            if order.filled_qty > 0 or order.status in _TERMINAL_UNFILLED_STATUS_VALUES:
                 return order
         if attempt < attempts:
             time.sleep(interval)
@@ -460,8 +529,9 @@ def _build_position_record(order, order_id: str, broker_order, broker_mode: str)
     """
     Builds the hybrid_positions.json record for a just-submitted order,
     after _poll_order_fill()'s short verification window. `order` is the
-    planned HybridOrder from size_order(); `broker_order` is the last Order
-    _poll_order_fill() saw (None if every lookup attempt failed).
+    planned HybridOrder from size_order(); `broker_order` is the last
+    OrderStatusInfo _poll_order_fill() saw (None if every lookup attempt
+    failed).
     """
     base = {
         "symbol": order.symbol,
@@ -472,12 +542,12 @@ def _build_position_record(order, order_id: str, broker_order, broker_mode: str)
         "submitted_at": now_ny().isoformat(timespec="seconds"),
     }
 
-    filled_qty = float(broker_order.filled_qty or 0) if broker_order is not None else 0.0
+    filled_qty = broker_order.filled_qty if broker_order is not None else 0.0
     if filled_qty > 0:
         fill_price = float(broker_order.filled_avg_price)
         base.update(_recompute_after_fill(base, fill_price, filled_qty))
         base["status"] = "OPEN"
-        base["broker_order_status"] = broker_order.status.value
+        base["broker_order_status"] = broker_order.status
         return base
 
     # Not filled within the poll window (or every poll attempt failed) —
@@ -488,7 +558,7 @@ def _build_position_record(order, order_id: str, broker_order, broker_mode: str)
         entry_price=order.entry_price, current_stop=order.stop_price,
         highest_high=order.entry_price, shares=order.shares,
         target_price=order.target_price, status="PENDING",
-        broker_order_status=(broker_order.status.value if broker_order is not None
+        broker_order_status=(broker_order.status if broker_order is not None
                              else "lookup_failed"),
     ))
     return base
@@ -584,6 +654,9 @@ def execute_signals() -> None:
         active_count += 1   # this cycle's new OPEN/PENDING entry now occupies a slot too
 
         if record["status"] == "OPEN":
+            _log_slippage(order.symbol, order.trade_type, order.entry_price,
+                         record["entry_price"], record["shares"], order_id,
+                         broker_mode)
             print(f"{s.symbol}: FILLED -> OPEN ({record['shares']} sh @ "
                  f"{record['entry_price']})")
         else:
@@ -639,9 +712,9 @@ def reconcile_local_state(b, positions: dict) -> list[dict]:
         if pos.get("status") != "OPEN" or sym in live:
             continue
         try:
-            order = b._trading.get_order_by_id(pos["order_id"])
-            filled_qty = float(order.filled_qty or 0)
-            order_status = str(order.status)
+            order = b.get_order_status(pos["order_id"])
+            filled_qty = order.filled_qty
+            order_status = order.status
         except Exception as e:                                      # noqa: BLE001
             print(f"{sym}: local state says OPEN but broker holds no shares, and "
                   f"the entry order lookup failed ({type(e).__name__}: {e}) — "
@@ -686,20 +759,23 @@ def reconcile_pending_entries(b, positions: dict) -> tuple[list[dict], list[dict
         if pos.get("status") != "PENDING":
             continue
         try:
-            order = b._trading.get_order_by_id(pos["order_id"])
+            order = b.get_order_status(pos["order_id"])
         except Exception as e:                                      # noqa: BLE001
             print(f"{sym}: PENDING order lookup failed ({type(e).__name__}: {e}) "
                   f"— leaving PENDING, will retry next cycle")
             continue
 
-        filled_qty = float(order.filled_qty or 0)
-        order_status = order.status.value
+        filled_qty = order.filled_qty
+        order_status = order.status
 
         if filled_qty > 0:
             fill_price = float(order.filled_avg_price)
+            intended_price = pos["entry_price"]   # signal price, before _recompute_after_fill overwrites it
             pos.update(_recompute_after_fill(pos, fill_price, filled_qty))
             pos["status"] = "OPEN"
             pos["broker_order_status"] = order_status
+            _log_slippage(sym, pos["trade_type"], intended_price, fill_price,
+                         pos["shares"], pos["order_id"], pos.get("broker_mode", ""))
             print(f"{sym}: PENDING -> OPEN (filled {filled_qty} sh @ "
                   f"{fill_price:.4f}, order status={order_status})")
             promoted.append(pos)
