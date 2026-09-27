@@ -230,6 +230,25 @@ class Broker(abc.ABC):
         `status` vocabulary and the incident this method exists to prevent.
         """
 
+    @abc.abstractmethod
+    def get_buying_power(self) -> float:
+        """
+        Actual, currently-tradable cash a NEW order can spend right now —
+        NOT get_equity(). The two answer different questions: get_equity()
+        is total account value (cash + long market value), the correct
+        basis for RISK-based position SIZING (risk a % of total capital,
+        standard practice, unaffected by short-term cash-vs-position mix).
+        get_buying_power() is what the broker will actually let a new
+        order execute against, which can be materially LESS than equity —
+        on a Robinhood cash account specifically, funds from a recent sale
+        are "unsettled" for 1-2 trading days and cannot fund a new
+        purchase, even though they count fully toward equity. A real
+        rejection ("not enough buying power") was hit live on this exact
+        gap between the two figures — hybrid_engine.py's entry path calls
+        this AFTER size_order() to cap/skip an order that equity-based
+        sizing alone would have over-sized.
+        """
+
     # -- error mapping (override in subclasses, then call super) ---------
     def _classify(self, exc: Exception) -> BrokerError:
         """

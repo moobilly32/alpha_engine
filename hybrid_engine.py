@@ -97,6 +97,7 @@ import os
 import sys
 import tempfile
 import time
+from dataclasses import replace
 
 from dotenv import load_dotenv
 
@@ -385,14 +386,65 @@ def _order_payload(order, broker_mode: str) -> dict:
     }
 
 
+BUYING_POWER_SAFETY_MARGIN = 0.99   # leave 1% headroom for price drift between
+                                    # the sizing snapshot and the actual fill
+MIN_ORDER_NOTIONAL_USD = 1.00       # below this, a "scaled down" order is
+                                    # economically meaningless dust, not a
+                                    # real position — skip instead
+
+
+def _cap_order_to_buying_power(order, buying_power: float):
+    """
+    Caps `order` (a HybridOrder from size_order()) to what the broker can
+    actually execute right now, per Broker.get_buying_power() — NOT a
+    resize of the RISK calculation itself (size_order()'s risk_pct x
+    equity math is untouched and stays keyed to total equity, standard
+    risk-management practice). This is a separate, later step: "the
+    strategy wants to risk $X, sized to N shares — can the broker actually
+    buy N shares right now?" A live rejection was hit exactly here (an
+    equity-sized order exceeded Robinhood's settled/tradable cash) — this
+    function is what turns that into a clean scale-down or skip instead of
+    a submitted-then-rejected order.
+
+    Returns `order` unchanged if it already fits within
+    buying_power * BUYING_POWER_SAFETY_MARGIN, a NEW order scaled down to
+    fit (same entry/stop/target prices, reduced shares/notional/
+    risk_dollars) if the scaled notional is still >= MIN_ORDER_NOTIONAL_USD,
+    or None if buying power is too thin to afford a REAL (non-dust) order —
+    a naive `shares <= 0` check alone is not enough here: rounding a tiny
+    buying_power to SHARE_PRECISION (6dp) can still produce a technically
+    positive but economically meaningless share count (e.g. 0.000042
+    shares, $0.00 notional), which this catches explicitly.
+    """
+    affordable = buying_power * BUYING_POWER_SAFETY_MARGIN
+    if order.notional <= affordable:
+        return order
+
+    scaled_shares = round(affordable / order.entry_price, 6)
+    scaled_notional = round(scaled_shares * order.entry_price, 2)
+    if scaled_shares <= 0 or scaled_notional < MIN_ORDER_NOTIONAL_USD:
+        return None
+
+    scale = scaled_shares / order.shares
+    scaled = replace(order, shares=scaled_shares, notional=scaled_notional,
+                     risk_dollars=round(order.risk_dollars * scale, 2))
+    print(f"{order.symbol}: scaling order down for buying power — "
+         f"{order.shares} sh (${order.notional:,.2f}) exceeds available "
+         f"${buying_power:,.2f}; using {scaled_shares} sh "
+         f"(${scaled.notional:,.2f}) instead")
+    return scaled
+
+
 def print_dry_run() -> None:
     """
     Simulates Step 2's position sizing for every currently active DIP/
-    BREAKOUT signal, using REAL current equity (broker.get_equity() — the
-    ONLY broker call this makes; buy_market() is never called) and real
-    live prices. Prints the complete order payload for each and exits. No
-    orders placed, no state written anywhere, including
-    hybrid_positions.json.
+    BREAKOUT signal, using REAL current equity and buying power
+    (broker.get_equity()/get_buying_power() — the ONLY broker calls this
+    makes; buy_market() is never called) and real live prices. Prints the
+    complete order payload for each — post buying-power cap, so this is
+    an accurate preview of what --execute would actually submit, not just
+    the uncapped risk-based size — and exits. No orders placed, no state
+    written anywhere, including hybrid_positions.json.
     """
     snaps = [s for s in snapshot_universe() if s.mode in ("DIP", "BREAKOUT")]
     broker_mode = os.getenv("BROKER_MODE", "")
@@ -400,14 +452,15 @@ def print_dry_run() -> None:
     try:
         b = make_broker()
         equity = b.get_equity()
+        buying_power = b.get_buying_power()
     except Exception as e:                                          # noqa: BLE001
-        print(f"hybrid_engine --dry-run: could not fetch live equity "
-              f"({type(e).__name__}: {e}) — aborting; no simulated numbers "
-              f"without a real balance")
+        print(f"hybrid_engine --dry-run: could not fetch live equity/buying "
+              f"power ({type(e).__name__}: {e}) — aborting; no simulated "
+              f"numbers without a real balance")
         return
 
-    print(f"DRY RUN — equity ${equity:,.2f} (live, read-only get_equity() "
-          f"call; no order will be placed)")
+    print(f"DRY RUN — equity ${equity:,.2f}, buying power ${buying_power:,.2f} "
+         f"(live, read-only calls; no order will be placed)")
 
     blocked, reasons = check_entry_gates()
     if blocked:
@@ -429,6 +482,13 @@ def print_dry_run() -> None:
             print("  no valid order (ATR undefined, or risk/share count "
                   "rounds to 0 shares)\n")
             continue
+        order = _cap_order_to_buying_power(order, buying_power)
+        if order is None:
+            print(f"--- {s.symbol} ({s.mode}) ---")
+            print(f"  buying power (${buying_power:,.2f}) can't afford even "
+                  f"1 share — would be skipped\n")
+            continue
+        buying_power = max(0.0, buying_power - order.notional)
         print(f"--- {order.symbol} ({order.trade_type}) ---")
         for k, v in _order_payload(order, broker_mode).items():
             print(f"  {k:<12}: {v}")
@@ -594,19 +654,29 @@ def execute_signals() -> None:
     strength of order SUBMISSION alone. A market order for a liquid symbol
     normally fills within the first poll attempt, so PENDING should be
     the rare case here, not the common one.
+
+    BUYING POWER: after size_order() computes the risk-based share count
+    (off total equity), _cap_order_to_buying_power() scales it down (or
+    skips the signal) if it exceeds Broker.get_buying_power() — the
+    actual tradable cash right now, which can be materially less than
+    equity on a Robinhood cash account with unsettled funds. This is what
+    turns a real rejection (hit live on this account) into a clean scale
+    or skip instead of a submitted-then-rejected order.
     """
     snaps = [s for s in snapshot_universe() if s.mode in ("DIP", "BREAKOUT")]
 
     try:
         b = make_broker()
         equity = b.get_equity()
+        buying_power = b.get_buying_power()
     except Exception as e:                                          # noqa: BLE001
-        print(f"hybrid_engine --execute: could not connect/fetch equity "
-              f"({type(e).__name__}: {e}) — aborting")
+        print(f"hybrid_engine --execute: could not connect/fetch equity/buying "
+              f"power ({type(e).__name__}: {e}) — aborting")
         return
 
     broker_mode = os.getenv("BROKER_MODE", "")
-    print(f"EXECUTE — equity ${equity:,.2f} ({broker_mode})")
+    print(f"EXECUTE — equity ${equity:,.2f}, buying power ${buying_power:,.2f} "
+         f"({broker_mode})")
 
     blocked, reasons = check_entry_gates()
     if blocked:
@@ -638,12 +708,20 @@ def execute_signals() -> None:
         if order is None:
             print(f"{s.symbol}: {s.mode} signal active but no valid order — skipping")
             continue
+
+        order = _cap_order_to_buying_power(order, buying_power)
+        if order is None:
+            print(f"{s.symbol}: {s.mode} signal active but buying power "
+                 f"(${buying_power:,.2f}) can't afford even 1 share — skipping")
+            continue
+
         try:
             order_id = b.buy_market(order.symbol, order.shares)
         except Exception as e:                                      # noqa: BLE001
             print(f"{s.symbol}: buy_market failed — {type(e).__name__}: {e}")
             continue
 
+        buying_power = max(0.0, buying_power - order.notional)   # this cycle's remaining orders see less
         print(f"{s.symbol}: market order submitted -> {order_id} "
              f"({order.shares} sh, sized off ~{order.entry_price} snapshot "
              f"price) — verifying fill...")

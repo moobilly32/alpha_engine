@@ -314,6 +314,32 @@ class RobinhoodBroker(Broker):
 
         return self._resilient("get_equity", _do)
 
+    def get_buying_power(self) -> float:
+        """
+        `cash_available_for_withdrawal` from load_account_profile() — the
+        conservative, literal "settled cash you can actually spend right
+        now" figure, NOT `buying_power` from the same payload (which
+        includes margin/instant-deposit extension and was observed live to
+        still overstate what a real order could execute — a $1,152 order
+        was rejected by Robinhood even though `buying_power` reported
+        $1,828 available at the time). Defaults to 0.0 (never negative,
+        never a crash) if the field is missing/unparseable, since "assume
+        nothing is available" is the safe failure mode for an affordability
+        check — the caller skips or scales the order down, it does not
+        guess a number and submit anyway.
+        """
+        def _do() -> float:
+            with self._lock:
+                payload = self._rh.profiles.load_account_profile(
+                    account_number=self._account_number)
+            payload = self._check_payload("get_buying_power", payload)
+            cash = payload.get("cash_available_for_withdrawal")
+            if cash in (None, "None", ""):
+                return 0.0
+            return max(0.0, float(cash))
+
+        return self._resilient("get_buying_power", _do)
+
     def get_order_status(self, order_id: str) -> OrderStatusInfo:
         """
         NOTE ON FIELD NAMES: `state`, `cumulative_quantity`, and

@@ -257,6 +257,13 @@ class AlpacaBroker(Broker):
 
         return self._resilient("get_equity", _do)
 
+    def get_buying_power(self) -> float:
+        def _do() -> float:
+            acct = self._trading.get_account()
+            return max(0.0, float(acct.buying_power))
+
+        return self._resilient("get_buying_power", _do)
+
     def get_order_status(self, order_id: str) -> OrderStatusInfo:
         from alpaca.trading.enums import OrderStatus as _AlpacaOrderStatus
 
