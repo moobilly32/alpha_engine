@@ -351,7 +351,7 @@ def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray,
     if len(h) < 2:
         return np.full(len(h), np.nan)
     tr = _true_range(h, l, c)
-    out = pd.Series(tr).ewm(alpha=1.0 / period, adjust=False).mean().to_numpy()
+    out = pd.Series(tr).ewm(alpha=1.0 / period, adjust=False).mean().to_numpy(copy=True)
     out[:period] = np.nan
     return out
 
@@ -391,7 +391,7 @@ def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray,
 
     di_sum = (plus_di + minus_di).replace(0.0, np.nan)
     dx = 100.0 * (plus_di - minus_di).abs() / di_sum
-    adx_val = dx.ewm(alpha=alpha, adjust=False).mean().to_numpy()
+    adx_val = dx.ewm(alpha=alpha, adjust=False).mean().to_numpy(copy=True)
     adx_val[:period] = np.nan
     return adx_val
 
