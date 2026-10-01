@@ -21,17 +21,30 @@ What this DOES reuse — shared, read-only library code, not the live engine:
     yfinance data layer (disk-cached under .cache/; that cache is the only
     thing this module ever writes to disk).
 
-DATA WINDOW — a deliberate deviation from "fetch 50 daily bars"
+DATA WINDOW — fetches 2 years, not 50 bars
     50 raw bars cannot support this module's own math. ADX(14) needs ~14
-    bars of warmup before its first reading exists at all, and the 80th-
-    percentile threshold needs 50 of THOSE readings in a rolling window —
-    50 total bars would yield close to zero valid percentile observations,
-    not a real 50-sample window. This fetches ~6 months (~126 trading days)
-    instead: comfortable warmup for RSI(14)/Bollinger(20)/ATR(14)/ADX(14)
-    plus a properly-populated 50-session ADX percentile. It deliberately
-    still avoids the 200-bar SMA200 trend gate Phase 1's full signal uses —
-    the dip criterion specified here is exactly RSI<35 OR price<=lower BB,
-    no trend filter, so 200 bars of history buys nothing for this build.
+    bars of warmup before its first reading exists at all, the 80th-
+    percentile threshold needs 50 of THOSE readings in a rolling window, and
+    the DIP trend gate below needs a 200-session SMA plus one more day of
+    lag on top of that. This fetches ~2 years (~504 trading days): well
+    past all three warmups with a comfortable buffer, matching the backtest's
+    own ~400-calendar-day seed window in spirit.
+
+    DIP TREND GATE — reinstated to match backtest.py's validated
+    daily_hybrid_frame() exactly, after a live/backtest divergence was found
+    and quantified (see git history around the date this comment was added):
+    this module originally computed DIP eligibility as bare
+    `RSI<35 OR Close<=BB_low`, with no trend filter at all, because the data
+    window was too short to support one. Measured against the identical
+    2022-present backtest that otherwise validates this strategy, that bare
+    trigger alone degrades CAGR from +17.87% to +10.96% and roughly DOUBLES
+    max drawdown (9.84% -> 20.04%) — removing the trend gate lets the engine
+    buy "oversold" readings inside long-term downtrends (catching falling
+    knives), which the backtest's trend-filtered version never permits. The
+    gate is now: `prev_close > prev_sma200 AND close > sma200` (both the
+    prior day's AND today's close above the 200-day SMA — the same
+    OVERSOLD_REQUIRE_ABOVE_SMA200=True behavior config.py already uses for
+    the backtest), ANDed with the RSI/BB trigger below.
 
 SIGNAL TIMING — last COMPLETED daily bar, never today's still-forming one
     Same non-repainting discipline the live engine's --screen fix uses:
@@ -57,10 +70,15 @@ from backtest import (
     ATR_PERIOD, VOLUME_MULT, VOLUME_SMA_WINDOW, BREAKOUT_LOOKBACK,
 )
 from calendar_util import now_ny
-from config import RSI_PERIOD, BB_PERIOD, BB_K, RSI_OVERSOLD, STOP_PCT, TARGET_R
+from config import (
+    RSI_PERIOD, BB_PERIOD, BB_K, RSI_OVERSOLD, STOP_PCT, TARGET_R,
+    OVERSOLD_REQUIRE_ABOVE_SMA200,
+)
 
-DATA_PERIOD = "6mo"                              # see module docstring
-MIN_BARS_REQUIRED = ADX_PERCENTILE_WINDOW + 30   # ADX warmup + real buffer
+DATA_PERIOD = "2y"                               # see module docstring — must
+                                                  # cover the 200-day SMA trend gate
+SMA200_WINDOW = 200
+MIN_BARS_REQUIRED = max(ADX_PERCENTILE_WINDOW + 30, SMA200_WINDOW + 30)
 
 # ---------------------------------------------------------------- Step 2/3: sizing
 # Asymmetric risk: a DIP is a confirmed mean-reversion setup (oversold, prior
@@ -142,8 +160,8 @@ class SymbolSnapshot:
 def load_symbol_frame(symbol: str) -> pd.DataFrame | None:
     """
     Daily bars for `symbol` plus every indicator this module needs, or None
-    if there is not enough history yet. Adds: RSI, BB_LOW, ADX, ADX_80TH,
-    ATR14, VOL_SMA20, VOL_RATIO, PRIOR_HIGH, DIP_OK, BREAKOUT_OK.
+    if there is not enough history yet. Adds: RSI, BB_LOW, SMA200, ADX,
+    ADX_80TH, ATR14, VOL_SMA20, VOL_RATIO, PRIOR_HIGH, DIP_OK, BREAKOUT_OK.
     """
     try:
         daily = data.daily_bars(symbol, period=DATA_PERIOD)
@@ -159,6 +177,7 @@ def load_symbol_frame(symbol: str) -> pd.DataFrame | None:
 
     rsi_v = strategy.rsi(close, RSI_PERIOD)
     _, bb_low, _ = strategy.bollinger(close, BB_PERIOD, BB_K)
+    sma200 = pd.Series(close).rolling(SMA200_WINDOW).mean().to_numpy()
     adx_v = strategy.adx(high, low, close, ATR_PERIOD)
     atr_v = strategy.atr(high, low, close, ATR_PERIOD)
 
@@ -177,9 +196,26 @@ def load_symbol_frame(symbol: str) -> pd.DataFrame | None:
 
     prior_high = pd.Series(high).shift(1).rolling(BREAKOUT_LOOKBACK).max().to_numpy()
 
+    # Trend gate + RSI/BB trigger — matches backtest.py's daily_hybrid_frame()
+    # exactly (same prev_close/prev_sma200 shift, same OVERSOLD_REQUIRE_
+    # ABOVE_SMA200 branch, same Low-based BB touch) rather than a second,
+    # independently-typed copy of this math. See module docstring for why.
+    prev_close = np.empty_like(close)
+    prev_close[0] = np.nan
+    prev_close[1:] = close[:-1]
+    prev_sma200 = np.empty_like(sma200)
+    prev_sma200[0] = np.nan
+    prev_sma200[1:] = sma200[:-1]
+    trend_ok = np.where(np.isnan(prev_close) | np.isnan(prev_sma200), False,
+                        prev_close > prev_sma200)
+    if OVERSOLD_REQUIRE_ABOVE_SMA200:
+        above_now = np.where(np.isnan(sma200), False, close > sma200)
+    else:
+        above_now = np.full(len(close), True)
+
     dip_rsi_ok = np.where(np.isnan(rsi_v), False, rsi_v < RSI_OVERSOLD)
-    dip_bb_ok = np.where(np.isnan(bb_low), False, close <= bb_low)
-    dip_ok = dip_rsi_ok | dip_bb_ok
+    dip_bb_ok = np.where(np.isnan(bb_low), False, low <= bb_low)
+    dip_ok = trend_ok & above_now & (dip_rsi_ok | dip_bb_ok)
 
     vol_ok = np.where(np.isnan(vol_ratio), False, vol_ratio > VOLUME_MULT)
     breakout_price_ok = np.where(np.isnan(prior_high), False, close > prior_high)
@@ -188,6 +224,7 @@ def load_symbol_frame(symbol: str) -> pd.DataFrame | None:
     out = daily.copy()
     out["RSI"] = rsi_v
     out["BB_LOW"] = bb_low
+    out["SMA200"] = sma200
     out["ADX"] = adx_v
     out["ADX_80TH"] = adx_80th
     out["ATR14"] = atr_v
